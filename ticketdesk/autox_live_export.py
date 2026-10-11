@@ -16,6 +16,7 @@ TEMPLATE = ROOT / 'autox' / 'maoyan_live_template.js'
 LIVE_OUTPUT = DATA / 'autox-maoyan-live.js'
 REHEARSAL_OUTPUT = DATA / 'autox-maoyan-rehearsal.js'
 FLOW_PROBE_OUTPUT = DATA / 'autox-maoyan-flow-probe.js'
+CONGESTION_PROBE_OUTPUT = DATA / 'autox-maoyan-congestion-probe.js'
 
 
 def build_locked_prototype(profile: dict, template: str | None = None) -> str:
@@ -65,6 +66,28 @@ def build_selection_rehearsal_script(profile: dict, template: str | None = None)
     return script.replace(gate, 'var SELECTION_REHEARSAL = true;', 1)
 
 
+def build_payment_script(profile: dict, template: str | None = None) -> str:
+    """Submit an explicit order-creation action once, then stop at cashier."""
+    script = build_live_script(profile, template)
+    gate = 'var SUBMIT_TO_PAYMENT = false;'
+    if script.count(gate) != 1:
+        raise RuntimeError('手机端提交到支付页开关异常。')
+    return script.replace(gate, 'var SUBMIT_TO_PAYMENT = true;', 1)
+
+
+def build_wechat_script(profile: dict, template: str | None = None) -> str:
+    """Create an order, launch the verified WeChat route once, never pay."""
+    script = build_payment_script(profile, template)
+    gate = 'var OPEN_WECHAT_PAYMENT = false;'
+    if script.count(gate) != 1:
+        raise RuntimeError('手机端微信跳转开关异常。')
+    script = script.replace(gate, 'var OPEN_WECHAT_PAYMENT = true;', 1)
+    selected_gate = 'var USER_PRESELECTED = false;'
+    if script.count(selected_gate) != 1:
+        raise RuntimeError('手机端用户预选开关异常。')
+    return script.replace(selected_gate, 'var USER_PRESELECTED = true;', 1)
+
+
 def build_flow_probe_script(profile: dict, template: str | None = None) -> str:
     """Inspect any supported flow page with the live selectors and no clicks."""
     script = build_live_script(profile, template)
@@ -72,6 +95,15 @@ def build_flow_probe_script(profile: dict, template: str | None = None) -> str:
     if script.count(gate) != 1:
         raise RuntimeError('手机端只读流程检查开关异常。')
     return script.replace(gate, 'var FLOW_PRECHECK_ONLY = true;', 1)
+
+
+def build_congestion_probe_script(profile: dict, template: str | None = None) -> str:
+    """Inspect the real congestion dialog and refresh bounds without any action."""
+    script = build_flow_probe_script(profile, template)
+    gate = 'var CONGESTION_PRECHECK_ONLY = false;'
+    if script.count(gate) != 1:
+        raise RuntimeError('手机端拥堵只读检查开关异常。')
+    return script.replace(gate, 'var CONGESTION_PRECHECK_ONLY = true;', 1)
 
 
 def export_live_selected(*, selection: Path = SELECTION,
@@ -83,7 +115,7 @@ def export_live_selected(*, selection: Path = SELECTION,
     profile = (store or ProfileStore()).get(identifier)
     if profile is None:
         raise ValueError('已选演出资料不存在，请重新选择。')
-    script = build_live_script(profile)
+    script = build_wechat_script(profile)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix('.tmp')
     temporary.write_text(script, encoding='utf-8')

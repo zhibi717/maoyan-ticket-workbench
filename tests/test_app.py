@@ -159,16 +159,15 @@ class ApiTests(unittest.TestCase):
                 self.request(path,data)
             self.assertEqual(exc.exception.code,400)
 
-    def test_autox_cannot_open_before_sale_window(self):
+    def test_autox_can_transfer_before_sale_window(self):
         profile = {**PROFILE, 'platform': 'maoyan', 'users': ['测试甲'],
                    'sale_time': '2026-10-20T15:00:00+08:00'}
         with self.request('/api/profile/save', profile):
             pass
-        with patch('ticketdesk.autox_phone.open_live_on_phone',
-                   side_effect=AssertionError('phone should not open')):
-            with self.assertRaises(urllib.error.HTTPError) as exc:
-                self.request('/api/autox/open', {})
-        self.assertEqual(exc.exception.code, 400)
+        with patch('ticketdesk.autox_phone.open_live_on_phone') as open_phone:
+            with self.request('/api/autox/open', {}) as response:
+                self.assertTrue(json.load(response)['ok'])
+        open_phone.assert_called_once()
 
     def test_autox_selection_rehearsal_can_open_before_sale_without_live_attempt(self):
         profile = {**PROFILE, 'platform': 'maoyan', 'users': ['测试甲'],
@@ -177,6 +176,16 @@ class ApiTests(unittest.TestCase):
             pass
         with patch('ticketdesk.autox_phone.open_rehearsal_on_phone') as open_phone:
             with self.request('/api/autox/rehearsal/open', {}) as response:
+                self.assertTrue(json.load(response)['ok'])
+        open_phone.assert_called_once()
+
+    def test_autox_congestion_probe_can_open_before_sale_without_live_attempt(self):
+        profile = {**PROFILE, 'platform': 'maoyan', 'users': ['测试甲'],
+                   'sale_time': '2026-10-20T15:00:00+08:00'}
+        with self.request('/api/profile/save', profile):
+            pass
+        with patch('ticketdesk.autox_phone.open_congestion_probe_on_phone') as open_phone:
+            with self.request('/api/autox/congestion/probe', {}) as response:
                 self.assertTrue(json.load(response)['ok'])
         open_phone.assert_called_once()
 

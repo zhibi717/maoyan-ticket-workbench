@@ -1,11 +1,15 @@
 // EXPERIMENTAL AutoX v7 Rhino prototype. Do not enable until the read-only
 // phone probe and real Maoyan sale/selection/order layouts have been checked.
-// No fixed coordinates, blind retries, order submission, or payment actions.
+// No fixed coordinates, blind retries, or final payment actions.
 var TARGET = null;
 var ENABLE_EXPERIMENTAL_LIVE = false;
 var PRECHECK_ONLY = false;
 var SELECTION_REHEARSAL = false;
 var FLOW_PRECHECK_ONLY = false;
+var SUBMIT_TO_PAYMENT = false;
+var CONGESTION_PRECHECK_ONLY = false;
+var OPEN_WECHAT_PAYMENT = false;
+var USER_PRESELECTED = false;
 
 (function () {
     if (!ENABLE_EXPERIMENTAL_LIVE) {
@@ -38,6 +42,29 @@ var FLOW_PRECHECK_ONLY = false;
     var screen = null;
     var screenReads = 0;
     var screenReadMs = 0;
+    var screenReadMaxMs = 0;
+    var readOrderFields = false;
+    var patterns = {};
+    var lastScreenReadMs = 0;
+    var labelReads = 0;
+    var preparedProbe = null;
+    var terminalState = "not_submitted";
+    var retainedDateSelection = false;
+    var retainedTierSelection = false;
+    var entryFoundEpochMs = null;
+    var entryClickEpochMs = null;
+    var entryClickCallMs = null;
+    var congestionRefreshes = 0;
+    var lastCongestionRefreshMs = null;
+    var congestionProbe = null;
+    var datePattern = null;
+    var rawAmount = String(TARGET.amount);
+    var amountTokens = [rawAmount, rawAmount.replace(/\B(?=(\d{3})+(?!\d))/g, ",")];
+    var nameDigests = {};
+    var digestCacheCount = 0;
+    var screenPackage = PACKAGE;
+    var wechatLaunchAttempted = false;
+    var submittedAmount = null;
     function mark(name) {
         phase = name;
         marks.push(name + "=" + (Date.now() - timeOrigin) + "ms");
@@ -45,7 +72,9 @@ var FLOW_PRECHECK_ONLY = false;
     function report(message) {
         // Only fixed stage names and relative timings are emitted. No account,
         // attendee, or raw screen text is included in the diagnostic log.
-        var line = message + "；阶段=" + phase + "；轨迹=" + marks.join(",");
+        var line = message + "；阶段=" + phase + "；轨迹=" + marks.join(",") +
+            "；页面读取=" + screenReads + "次/" + screenReadMs +
+            "ms；最长读取=" + screenReadMaxMs + "ms；轻量读取=" + labelReads + "次";
         console.log(line);
         try { android.util.Log.i("QiangpiaoAutoX", line); } catch (ignored) {}
         if (FLOW_PRECHECK_ONLY) {
@@ -54,25 +83,56 @@ var FLOW_PRECHECK_ONLY = false;
                     finishedEpochMs: Date.now(), readOnly: true,
                     elapsedMs: Date.now() - timeOrigin,
                     screenReads: screenReads, screenReadMs: screenReadMs,
+                    screenReadMaxMs: screenReadMaxMs,
+                    congestionProbe: congestionProbe,
+                    preparedProbe: preparedProbe,
                     message: line
                 }));
             } catch (ignoredFile) {}
         }
+        if (SUBMIT_TO_PAYMENT && !FLOW_PRECHECK_ONLY && !SELECTION_REHEARSAL) {
+            try {
+                files.write("/sdcard/Download/qiangpiao-payment-result.json", JSON.stringify({
+                    finishedEpochMs: Date.now(), state: terminalState,
+                    screenReads: screenReads, screenReadMs: screenReadMs,
+                    entryFoundAfterSaleMs: entryFoundEpochMs === null ? null : entryFoundEpochMs - TARGET.saleEpochMs,
+                    entryClickAfterSaleMs: entryClickEpochMs === null ? null : entryClickEpochMs - TARGET.saleEpochMs,
+                    entryDiscoveryToClickMs: entryFoundEpochMs === null || entryClickEpochMs === null ? null :
+                        entryClickEpochMs - entryFoundEpochMs,
+                    entryClickCallMs: entryClickCallMs,
+                    congestionRefreshes: congestionRefreshes,
+                    wechatLaunchAttempted: wechatLaunchAttempted,
+                    message: line, automaticPayment: false
+                }));
+            } catch (ignoredResult) {}
+        }
     }
 
     function stop(message) { throw { safe: true, message: message }; }
-    function readScreen() {
+    // Shared methods avoid five new Rhino function objects per copied node.
+    function rowBounds() { return this.area; }
+    function rowText() { return this.label; }
+    function rowEnabled() { return this.isEnabled; }
+    function rowChecked() { return this.isChecked; }
+    function rowParent() { return this.ancestor; }
+    function readScreen(labelsOnly, allowWechat) {
         // One fresh Android tree per decision. AutoX normal-mode selectors
         // fetch the tree again for every find/exists; dozens of absent-label
         // queries took 12.7 seconds on the actual detail screen.
         var started = Date.now();
         var root = auto.service.getRootInActiveWindow();
-        if (root == null || String(root.getPackageName() || "") !== PACKAGE) {
+        var activePackage = root === null ? "" : String(root.getPackageName() || "");
+        if (root == null || activePackage !== PACKAGE &&
+                !(allowWechat && OPEN_WECHAT_PAYMENT && activePackage === "com.tencent.mm")) {
             screen = null;
             if (root != null) root.recycle();
             stop("猫眼已不在前台，已停止。");
         }
+        screenPackage = activePackage;
         var nodes = [], stack = [{ raw: root, parent: null }];
+        // Copy coordinates into each row, but reuse the Java output argument.
+        // This avoids a native Rect allocation for every node in the tree.
+        var geometryRect = null;
         try {
             while (stack.length) {
                 if (nodes.length >= 1000 || Date.now() - started > 2000) {
@@ -80,26 +140,44 @@ var FLOW_PRECHECK_ONLY = false;
                 }
                 var current = stack.pop(), raw = current.raw;
                 try {
-                    var rect = new android.graphics.Rect();
-                    raw.getBoundsInScreen(rect);
+                    var label = String(raw.getText() || "");
+                    var description = String(raw.getContentDescription() || "");
+                    var needsGeometry = !labelsOnly || labelsOnly === "entry" &&
+                        (ENTRY_PATTERN.test(label) || ENTRY_PATTERN.test(description)) ||
+                        labelsOnly === "refresh" && (label === "刷新" || description === "刷新");
+                    if (labelsOnly === "prepared") needsGeometry = ENTRY_PATTERN.test(label) ||
+                        ENTRY_PATTERN.test(description) || SKU_CONFIRM.indexOf(label) >= 0 ||
+                        SKU_CONFIRM.indexOf(description) >= 0;
+                    var rect = null;
+                    if (needsGeometry) {
+                        if (geometryRect === null) geometryRect = new android.graphics.Rect();
+                        rect = geometryRect;
+                        raw.getBoundsInScreen(rect);
+                    }
+                    // Selection needs enabled/selected flags. Checkbox details
+                    // are only needed when inspecting the order review.
+                    var orderFields = !labelsOnly && readOrderFields;
+                    var classValue = orderFields ? String(raw.getClassName() || "") : "";
+                    var isCheckable = orderFields && raw.isCheckable();
                     var row = {
-                        label: String(raw.getText() || ""),
-                        description: String(raw.getContentDescription() || ""),
-                        classValue: String(raw.getClassName() || ""),
+                        label: label,
+                        description: description,
+                        classValue: classValue,
                         packageValue: String(raw.getPackageName() || ""),
-                        isEnabled: raw.isEnabled(),
-                        isChecked: raw.isChecked(),
-                        isCheckable: raw.isCheckable(),
-                        isSelected: raw.isSelected(),
-                        area: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom },
+                        isEnabled: needsGeometry && raw.isEnabled(),
+                        isChecked: orderFields &&
+                            (isCheckable || classValue === "android.widget.CheckBox") && raw.isChecked(),
+                        isCheckable: isCheckable,
+                        isSelected: !labelsOnly && raw.isSelected(),
+                        area: rect ? { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom } : null,
                         ancestor: current.parent
                     };
-                    row.bounds = function () { return this.area; };
-                    row.text = function () { return this.label; };
-                    row.enabled = function () { return this.isEnabled; };
-                    row.checked = function () { return this.isChecked; };
-                    row.parent = function () { return this.ancestor; };
-                    if (row.packageValue === PACKAGE) nodes.push(row);
+                    row.bounds = rowBounds;
+                    row.text = rowText;
+                    row.enabled = rowEnabled;
+                    row.checked = rowChecked;
+                    row.parent = rowParent;
+                    if (row.packageValue === activePackage) nodes.push(row);
                     for (var c = raw.getChildCount() - 1; c >= 0; c--) {
                         var child = raw.getChild(c);
                         if (child != null) stack.push({ raw: child, parent: row });
@@ -112,9 +190,18 @@ var FLOW_PRECHECK_ONLY = false;
         }
         screen = nodes;
         screenReads++;
-        screenReadMs += Date.now() - started;
+        var elapsed = Date.now() - started;
+        lastScreenReadMs = elapsed;
+        if (labelsOnly) labelReads++;
+        screenReadMs += elapsed;
+        screenReadMaxMs = Math.max(screenReadMaxMs, elapsed);
     }
-    function checkPackage() { readScreen(); }
+    function checkPackage(labelsOnly) { readScreen(labelsOnly); }
+    function pauseAfterRead(intervalMs) {
+        // A slow native read already consumed the polling interval.
+        var remaining = intervalMs - lastScreenReadMs;
+        if (remaining > 0) sleep(remaining);
+    }
     function matching(predicate) {
         if (screen == null) readScreen();
         var result = [];
@@ -129,21 +216,93 @@ var FLOW_PRECHECK_ONLY = false;
         });
     }
     function has(fragment) {
-        return matching(function (node) {
-            return node.label.indexOf(fragment) >= 0 || node.description.indexOf(fragment) >= 0;
-        }).length > 0;
+        if (screen == null) readScreen();
+        for (var i = 0; i < screen.length; i++) {
+            if (screen[i].label.indexOf(fragment) >= 0 ||
+                    screen[i].description.indexOf(fragment) >= 0) return true;
+        }
+        return false;
+    }
+    function hasPattern(pattern) {
+        if (screen == null) readScreen();
+        for (var i = 0; i < screen.length; i++) {
+            if (pattern.test(screen[i].label) || pattern.test(screen[i].description)) return true;
+        }
+        return false;
     }
     function hasAny(words) {
+        var key = words.join("\u0001");
+        if (patterns[key]) return hasPattern(patterns[key]);
         var alternatives = [];
         for (var i = 0; i < words.length; i++) {
             alternatives.push(words[i].replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
         }
-        var pattern = new RegExp(".*(?:" + alternatives.join("|") + ").*");
-        return matchingPattern(pattern, true).length > 0;
+        // test() already searches within the label. Leading .* needlessly
+        // backtracks at every character when a long notice has no match.
+        var pattern = new RegExp("(?:" + alternatives.join("|") + ")");
+        patterns[key] = pattern;
+        return hasPattern(pattern);
     }
     function checkBlockers() {
         if (hasAny(CHALLENGE)) stop("猫眼出现验证，请在手机手动处理并核对订单。");
         if (hasAny(PAYMENT)) stop("猫眼出现支付页面，请在手机核对并自行付款。");
+        if (hasCongestion()) {
+            if (!SUBMIT_TO_PAYMENT || FLOW_PRECHECK_ONLY || SELECTION_REHEARSAL) {
+                stop("当前有拥堵弹窗；只读或选档演练不会刷新，请在手机处理。");
+            }
+            recoverCongestion();
+            if (hasAny(CHALLENGE)) stop("刷新后出现验证，请在手机手动处理。");
+            if (hasAny(PAYMENT)) stop("刷新后已到支付页面，请自行决定付款。");
+        }
+    }
+    function hasCongestion() {
+        return has("前方拥堵") && has("请刷新重试");
+    }
+    function recoverCongestion() {
+        var deadline = TARGET.saleEpochMs + 1200000;
+        while (Date.now() < deadline) {
+            // Refresh is a separate dialog action, never a second submit.
+            // Each touch uses a new tree, and payment/verification always wins.
+            var allowWechat = OPEN_WECHAT_PAYMENT && terminalState === "submission_attempted";
+            readScreen("refresh", allowWechat);
+            if (screenPackage === "com.tencent.mm") return;
+            if (hasAny(CHALLENGE)) stop("拥堵重试出现验证，请在手机手动完成。");
+            if (hasAny(PAYMENT) || has("待付款") && !has("实名观演人")) return;
+            if (!hasCongestion()) {
+                // Resume with a full fresh snapshot: SKU selection and order
+                // checkbox decisions must not use refresh-only properties.
+                readScreen(false, allowWechat);
+                if (screenPackage === "com.tencent.mm") return;
+                if (hasCongestion()) continue;
+                return;
+            }
+            if (!orderIdentityMatches() && !(has("选择票档") && dateNodes().length === 1)) {
+                stop("拥堵弹窗下未确认目标订单或票档，已停止刷新。");
+            }
+            if (congestionRefreshes >= 3000) stop("拥堵刷新已达本次上限，已停止；请在手机核对。");
+            var refresh = unique(exactNodes(["刷新"]), "拥堵刷新按钮");
+            if (!refresh.enabled()) {
+                pauseAfterRead(80);
+                continue;
+            }
+            var remaining = lastCongestionRefreshMs === null ? 0 :
+                lastCongestionRefreshMs + 400 - Date.now();
+            if (remaining > 0) {
+                sleep(remaining);
+                continue; // Re-read after waiting; never click the old snapshot.
+            }
+            if (Date.now() >= deadline) stop("已超过开售窗口，已停止刷新。");
+            safeButtonBounds(refresh, "拥堵刷新");
+            var b = refresh.bounds();
+            lastCongestionRefreshMs = Date.now();
+            congestionRefreshes++;
+            if (!click(Math.floor((b.left + b.right) / 2), Math.floor((b.top + b.bottom) / 2))) {
+                stop("拥堵刷新点击结果不明确，已停止；不会点击提交或支付。");
+            }
+            screen = null;
+            mark("拥堵刷新");
+        }
+        stop("拥堵恢复超时或已超过开售窗口，已停止刷新。");
     }
     function exactNodes(words) {
         return matching(function (node) {
@@ -170,7 +329,7 @@ var FLOW_PRECHECK_ONLY = false;
     }
     function safeButtonBounds(node, stage) {
         var b = node.bounds();
-        if (b.left < 0 || b.top < 0 || b.right > device.width ||
+        if (!b || b.left < 0 || b.top < 0 || b.right > device.width ||
                 b.bottom > device.height || b.right <= b.left || b.bottom <= b.top ||
                 b.bottom - b.top > device.height * 0.30) {
             stop(stage + "控件范围异常，已停止。");
@@ -182,21 +341,33 @@ var FLOW_PRECHECK_ONLY = false;
                 (b.top < device.height * 0.70 || b.left < device.width * 0.45)) {
             stop("票档确认按钮不在页面右下方，已停止。");
         }
+        if (stage === "提交订单" && b.top < device.height * 0.70) {
+            stop("提交订单按钮不在预期的页面下方，已停止。");
+        }
     }
-    function clickFresh(stage, resolveNodes, verifyContext) {
+    function clickFresh(stage, resolveNodes, verifyContext, beforeClick) {
         verifyContext();
         var node = unique(resolveNodes(), stage);
+        if (stage === "购票入口" && !node.enabled()) stop("购票入口尚不可用，已停止。");
         safeButtonBounds(node, stage);
         // The matched label is often a non-clickable child of a button.
         // A touch at the freshly verified label bounds reaches its parent.
         var b = node.bounds();
         var x = Math.floor((b.left + b.right) / 2);
         var y = Math.floor((b.top + b.bottom) / 2);
-        if (!click(x, y)) stop(stage + "点击结果不明确，已停止；请在手机核对。");
+        if (beforeClick) beforeClick();
+        var clickStarted = Date.now();
+        if (stage === "购票入口") entryClickEpochMs = clickStarted;
+        // Phone fixture: click() held the gesture for about 155 ms; a 1 ms
+        // press reached the button reliably. Keep the same fresh-page guards.
+        // Never fall back/retry after a failed or uncertain dispatched press.
+        var clicked = stage === "购票入口" && typeof press === "function" ? press(x, y, 1) : click(x, y);
+        if (stage === "购票入口") entryClickCallMs = Date.now() - clickStarted;
+        if (!clicked) stop(stage + "点击结果不明确，已停止；请在手机核对。");
         screen = null;
     }
-    function verifyDetail(requireReservation, reuseDecision) {
-        if (!reuseDecision) checkPackage();
+    function verifyDetail(requireReservation, reuseDecision, entryOnly) {
+        if (!reuseDecision) checkPackage(entryOnly ? "entry" : false);
         checkBlockers();
         if (!has(TARGET.titleToken) || !has(TARGET.city)) {
             stop("当前猫眼页面未同时显示目标演出与城市，已停止。");
@@ -208,9 +379,7 @@ var FLOW_PRECHECK_ONLY = false;
         }
     }
     function priceNodes() {
-        var raw = String(TARGET.amount);
-        var formatted = raw.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-        var nodes = containedTextNodes([raw, formatted]), result = [];
+        var nodes = containedTextNodes(amountTokens), result = [];
         for (var i = 0; i < nodes.length; i++) {
             var label = String(nodes[i].text() || "").replace(/[,，]/g, "");
             var numbers = label.match(/\d+(?:\.\d{1,2})?/g) || [];
@@ -224,7 +393,7 @@ var FLOW_PRECHECK_ONLY = false;
         if (!node.enabled()) return false;
         // Some builds put the stock badge in a sibling instead of in the
         // price label. Inspect only compact ancestors belonging to this card.
-        var badges = matchingPattern(/.*(?:缺货登记|售罄|不可售).*/, false);
+        var badges = matchingPattern(/(?:缺货登记|售罄|不可售)/, false);
         var parent = node.parent();
         for (var depth = 0; parent != null && depth < 2; depth++, parent = parent.parent()) {
             if (!parent.enabled()) return false;
@@ -240,18 +409,31 @@ var FLOW_PRECHECK_ONLY = false;
         return true;
     }
     function dateNodes() {
-        var alternatives = [];
-        for (var j = 0; j < TARGET.dateLabels.length; j++) {
-            alternatives.push(TARGET.dateLabels[j].replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+        if (datePattern === null) {
+            var alternatives = [];
+            for (var j = 0; j < TARGET.dateLabels.length; j++) {
+                alternatives.push(TARGET.dateLabels[j].replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+            }
+            datePattern = new RegExp("(?:" + alternatives.join("|") + ")");
         }
-        var pattern = new RegExp(".*(?:" + alternatives.join("|") + ").*");
-        var nodes = matchingPattern(pattern, false);
+        var nodes = matchingPattern(datePattern, false);
         var result = [];
         for (var i = 0; i < nodes.length; i++) {
             var label = String(nodes[i].text() || "");
             if (label.length <= 30 && label.indexOf(TARGET.titleToken) < 0) result.push(nodes[i]);
         }
         return result;
+    }
+    function visibleOrderAmount() {
+        var amounts = [], nodes = matching(function (node) { return /[¥￥]/.test(node.label); });
+        for (var i = 0; i < nodes.length; i++) {
+            var label = nodes[i].label.replace(/[,，]/g, ""), pattern = /[¥￥]\s*(\d+(?:\.\d{1,2})?)/g, match;
+            while ((match = pattern.exec(label)) !== null) {
+                var value = Number(match[1]);
+                if (value > 0 && value <= 100000 && amounts.indexOf(value) < 0) amounts.push(value);
+            }
+        }
+        return amounts.length === 1 ? amounts[0] : null;
     }
     function orderIdentityMatches() {
         if (!has(TARGET.titleToken) || !has(TARGET.city) || !has("实名观演人")) return false;
@@ -262,8 +444,11 @@ var FLOW_PRECHECK_ONLY = false;
             var currency = label.match(/[¥￥]\s*(\d+(?:\.\d{1,2})?)/);
             if (currency && Number(currency[1]) === TARGET.amount) amountMatched = true;
         }
-        if (!amountMatched) return false;
-        var quantities = matchingPattern(/.*\d+\s*张.*/, false);
+        if (USER_PRESELECTED) {
+            var actual = visibleOrderAmount();
+            if (actual === null || submittedAmount !== null && actual !== submittedAmount) return false;
+        } else if (!amountMatched) return false;
+        var quantities = matchingPattern(/\d+\s*张/, false);
         var one = false;
         for (var j = 0; j < quantities.length; j++) {
             var quantity = String(quantities[j].text() || "").match(/(\d+)\s*张/);
@@ -279,12 +464,21 @@ var FLOW_PRECHECK_ONLY = false;
         return { top: heading.bottom, bottom: next.top };
     }
     function nameDigest(value) {
+        // Cache computations, never UI decisions. A new name still receives
+        // its own hash and must match the target on the fresh screen.
+        // Runtime memory only: nothing here is written to files or logs.
+        var key = "\u0001" + value;
+        if (Object.prototype.hasOwnProperty.call(nameDigests, key)) return nameDigests[key];
         var bytes = new java.lang.String(value).getBytes("UTF-8");
         var digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes);
         var output = "";
         for (var i = 0; i < digest.length; i++) {
             var hex = (digest[i] & 255).toString(16);
             output += hex.length === 1 ? "0" + hex : hex;
+        }
+        if (digestCacheCount < 64) {
+            nameDigests[key] = output;
+            digestCacheCount++;
         }
         return output;
     }
@@ -315,6 +509,7 @@ var FLOW_PRECHECK_ONLY = false;
         return unique(orderCheckboxes(region), "唯一观演人勾选框");
     }
     function ensureOnlyAttendeeSelected() {
+        readOrderFields = true;
         if (pageKind() !== "order" || !orderIdentityMatches()) {
             stop("订单信息与目标演出不一致，已停止。");
         }
@@ -328,11 +523,11 @@ var FLOW_PRECHECK_ONLY = false;
             stop("观演人勾选结果不明确，已停止。");
         }
         mark("点击唯一观演人");
-        var selectedDeadline = Date.now() + 600;
+        var selectedDeadline = Date.now() + 2000;
         while (Date.now() < selectedDeadline) {
             if (pageKind() !== "order") stop("勾选后订单页已变化，请在手机核对。");
             if (targetAttendeeBox().checked()) return "已自动勾选";
-            sleep(40);
+            pauseAfterRead(Math.min(40, Math.max(0, selectedDeadline - Date.now())));
         }
         stop("未确认观演人已勾选，已停止；请在手机核对。");
     }
@@ -342,7 +537,131 @@ var FLOW_PRECHECK_ONLY = false;
             return;
         }
         var attendee = ensureOnlyAttendeeSelected();
+        if (SUBMIT_TO_PAYMENT) {
+            submitToPayment();
+            return;
+        }
         report("已进入订单页，唯一观演人" + attendee + "；请在手机核对并自行处理支付。");
+    }
+    function submitToPayment() {
+        // In WeChat mode, "立即支付" is accepted only on the identified
+        // purchase review, never as a generic payment confirmation button.
+        clickFresh("提交订单", function () {
+            if (!OPEN_WECHAT_PAYMENT && exactNodes(SUBMIT).length === 0 && exactNodes(["立即支付"]).length) {
+                stop("订单页仅显示立即支付，其动作尚未经真机确认；请手动点击进入支付页。");
+            }
+            var actions = SUBMIT;
+            if (OPEN_WECHAT_PAYMENT && exactNodes(ORDER_TITLE).length === 1) actions = SUBMIT.concat(["立即支付"]);
+            return exactNodes(actions).filter(function (node) { return node.enabled(); });
+        }, function () {
+            readOrderFields = true;
+            if (pageKind() !== "order" || !orderIdentityMatches() || !targetAttendeeBox().checked()) {
+                stop("提交前订单或观演人状态已变化，已停止。");
+            }
+            if (hasAny(["免密", "自动扣款", "先享后付"])) {
+                stop("页面出现自动扣款相关选项，请手动处理；程序不会提交或支付。");
+            }
+        }, function () {
+            // Persist before the single tap. No retry even if click() or the
+            // following page read fails; the existing atomic attempt lock stays.
+            if (USER_PRESELECTED) submittedAmount = visibleOrderAmount();
+            storage.put(TARGET.attemptKey, { state: "submission_attempted", at: Date.now() });
+            terminalState = "submission_attempted";
+        });
+        mark("已点击一次提交订单");
+        var deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+            // Observe the submission, then optionally initiate the verified
+            // WeChat gateway. Final payment confirmation is never clicked.
+            readScreen(true, OPEN_WECHAT_PAYMENT);
+            if (screenPackage === "com.tencent.mm") {
+                finishAtWechat();
+                return;
+            }
+            if (hasAny(CHALLENGE)) {
+                terminalState = "verification_required";
+                stop("提交后出现验证，请在手机手动完成；程序不会再次提交或付款。");
+            }
+            if (hasCongestion()) recoverCongestion();
+            if (screenPackage === "com.tencent.mm") { finishAtWechat(); return; }
+            if (hasAny(PAYMENT) || has("待付款") && !has("实名观演人")) {
+                if (OPEN_WECHAT_PAYMENT) {
+                    openWechatFromCashier();
+                    return;
+                }
+                terminalState = has("待付款") ? "pending_payment" : "payment_page";
+                mark("已到支付页面并停止");
+                report("已确认进入待付款或支付页面；自动操作已结束，请自行决定付款。");
+                return;
+            }
+            pauseAfterRead(80);
+        }
+        terminalState = "submission_unconfirmed";
+        stop("已提交一次，但未确认支付页面；请查看猫眼订单，程序不会重试或付款。");
+    }
+    function paymentAmountMatches() {
+        return matching(function (node) {
+            var text = node.label.replace(/[,，]/g, "");
+            var amount = text.match(/[¥￥]\s*(\d+(?:\.\d{1,2})?)/) ||
+                text.match(/^\s*(\d+(?:\.\d{1,2})?)\s*$/);
+            return amount !== null && Number(amount[1]) === (submittedAmount !== null ? submittedAmount : TARGET.amount);
+        }).length > 0;
+    }
+    function finishAtWechat() {
+        // No click, input, intent or gesture is ever issued in WeChat.
+        terminalState = hasAny(["微信支付", "确认支付", "付款", "支付方式"]) && paymentAmountMatches() ?
+            "wechat_payment_page" : "wechat_foreground_unconfirmed";
+        mark("微信前台停止");
+        report(terminalState === "wechat_payment_page" ?
+            "已识别微信付款页面及目标金额；脚本已停止，是否付款由你决定。" :
+            "已进入微信，付款页面或金额未确认；脚本已停止，请自行核对。");
+    }
+    function wechatSelected() {
+        var labels = exactNodes(["微信支付"]);
+        if (labels.length !== 1) return false;
+        var node = labels[0], bounds = node.bounds();
+        if (node.isCheckable && node.checked()) return true;
+        return matching(function (candidate) {
+            if (!candidate.isCheckable || !candidate.checked()) return false;
+            var b = candidate.bounds();
+            return b && bounds && b.left <= bounds.left && b.top <= bounds.top &&
+                b.right >= bounds.right && b.bottom >= bounds.bottom &&
+                b.bottom - b.top < device.height * 0.25;
+        }).length === 1;
+    }
+    function openWechatFromCashier() {
+        readOrderFields = true;
+        readScreen(false, true);
+        if (screenPackage === "com.tencent.mm") { finishAtWechat(); return; }
+        if (hasAny(CHALLENGE)) stop("收银台出现验证，请在手机手动处理。");
+        if (!has("收银台") || has("实名观演人") || !paymentAmountMatches() ||
+                hasAny(["免密", "自动扣款", "先享后付", "输入支付密码"])) {
+            terminalState = "cashier_manual_required";
+            stop("收银台跳转条件或金额未确认；请手动唤起微信，脚本不会付款。");
+        }
+        var direct = exactNodes(["前往微信支付", "跳转微信支付", "打开微信支付"]);
+        var candidates = direct.length ? direct : wechatSelected() ? exactNodes(["立即支付"]) : [];
+        terminalState = "cashier_manual_required";
+        var action = unique(candidates.filter(function (node) { return node.enabled(); }), "唤起微信按钮");
+        if (wechatLaunchAttempted) stop("本次已尝试唤起微信，已停止；不会重复操作。");
+        safeButtonBounds(action, "唤起微信");
+        var b = action.bounds();
+        wechatLaunchAttempted = true;
+        terminalState = "wechat_launch_attempted";
+        storage.put(TARGET.attemptKey, { state: "wechat_launch_attempted", at: Date.now() });
+        if (!click(Math.floor((b.left + b.right) / 2), Math.floor((b.top + b.bottom) / 2))) {
+            stop("唤起微信的点击结果不明确；请自行核对，程序不会重试。");
+        }
+        mark("已尝试唤起微信一次");
+        var deadline = Date.now() + 10000;
+        while (Date.now() < deadline) {
+            readScreen(true, true);
+            if (screenPackage === "com.tencent.mm") { finishAtWechat(); return; }
+            if (hasAny(CHALLENGE)) stop("唤起微信时出现验证，请在手机手动处理。");
+            pauseAfterRead(80);
+        }
+        terminalState = "wechat_launch_unconfirmed";
+        stop("未确认微信付款页面；已停止，请自行检查，不重试或付款。");
     }
     function targetDateAlreadySelected() {
         var target = unique(dateNodes(), "目标日期");
@@ -379,19 +698,241 @@ var FLOW_PRECHECK_ONLY = false;
         if (pageKind() !== "sku" || has("请选择票档")) {
             stop("目标票档尚未使确认按钮可用，已停止。");
         }
-        unique(priceNodes(), "目标票档");
+        var tier = unique(priceNodes(), "目标票档");
+        if (retainedDateSelection && !targetDateAlreadySelected() ||
+                retainedTierSelection && !nodeAlreadySelected(tier)) {
+            stop("确认前预选场次或票档状态已变化，已停止。");
+        }
         unique(exactNodes(["1张", "1 张", "1份", "1 份"]), "1 张数量");
         var button = unique(confirmationNodes(), "票档确认按钮");
         safeButtonBounds(button, "票档确认");
+    }
+    function waitForSkuConfirmation(timeoutMs) {
+        var deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            var kind = pageKind(screen !== null);
+            if (kind === "order") return kind;
+            if (kind === "sku") {
+                unique(priceNodes(), "目标票档");
+                var quantities = exactNodes(["1张", "1 张", "1份", "1 份"]);
+                var quantityLabels = matchingPattern(/\d+\s*(?:张|份)/, false);
+                for (var i = 0; i < quantityLabels.length; i++) {
+                    var count = quantityLabels[i].label.match(/(\d+)\s*(?:张|份)/);
+                    if (count && Number(count[1]) !== 1) stop("票档数量不是 1 张，已停止。");
+                }
+                if (!has("请选择票档") && quantities.length === 1 && confirmationNodes().length === 1) {
+                    return kind;
+                }
+            }
+            pauseAfterRead(80);
+            checkPackage();
+        }
+        stop("票档确认控件未及时就绪，已停止；不会重复选档。");
     }
     function waitForKind(timeoutMs) {
         var deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline) {
             var kind = pageKind();
             if (kind !== "unknown") return kind;
-            sleep(80);
+            pauseAfterRead(80);
         }
         stop("页面转换后未识别出选票或订单页，已停止。");
+    }
+    function continueSkuFlow() {
+        if (USER_PRESELECTED) {
+            continueUserSelectedSku();
+            return;
+        }
+        if (!targetDateAlreadySelected()) {
+            clickFresh("目标日期", dateNodes, function () {
+                if (pageKind() !== "sku") stop("目标日期选择页已变化，已停止。");
+            });
+            mark("点击目标日期");
+            // Read immediately, retry only while the sheet is transitioning.
+            waitForKind(1500);
+        } else {
+            retainedDateSelection = true;
+            mark("沿用已选日期");
+        }
+        // Reuse only the current decision, never a pre-click snapshot.
+        // A date click cleared screen, so that path must fetch a new tree.
+        if (pageKind(screen !== null) === "order") {
+            finishAtOrder();
+            return;
+        }
+        else {
+            if (!has("请选择票档")) {
+                if (!nodeAlreadySelected(unique(priceNodes(), "已选目标票档"))) {
+                    stop("票档页已有选择，但未确认是目标金额，请在手机核对。");
+                }
+                retainedTierSelection = true;
+                mark("沿用已选票档");
+            } else {
+                clickFresh("目标票档", priceNodes, function () {
+                    if (pageKind() !== "sku") stop("目标票档选择页已变化，已停止。");
+                });
+                mark("点击目标票档");
+            }
+            var choiceDeadline = Date.now() + 2000;
+            while (Date.now() < choiceDeadline &&
+                    (screen === null || has("请选择票档"))) {
+                checkPackage();
+                checkBlockers();
+                if (!has("请选择票档")) break;
+                pauseAfterRead(40);
+            }
+            if (has("请选择票档")) {
+                stop("目标票档未被选中或已不可售，已停止。");
+            }
+            var selectedPage = pageKind(true);
+            if (selectedPage !== "sku" && selectedPage !== "order") {
+                stop("票档点击后页面状态不明确，已停止；请在手机核对。");
+            }
+            mark("票档按钮已更新");
+            if (selectedPage === "order") {
+                finishAtOrder();
+                return;
+            }
+            if (SELECTION_REHEARSAL) {
+                report("选档演练已点中目标票档；未点击确认，请在猫眼核对。");
+                return;
+            }
+            // Button text, quantity and enabled state can arrive in
+            // separate accessibility updates. Ready pages return without
+            // another read or delay; slower pages are observed only.
+            if (waitForSkuConfirmation(2000) === "order") {
+                finishAtOrder();
+                return;
+            }
+            clickFresh("票档确认", confirmationNodes,
+                verifySelectedSku);
+            mark("点击票档确认");
+            var orderDeadline = Date.now() + 8000;
+            while (Date.now() < orderDeadline) {
+                if (pageKind() === "order") {
+                    mark("到达订单页");
+                    finishAtOrder();
+                    return;
+                }
+                pauseAfterRead(80);
+            }
+            stop("已点击票档确认，但未确认进入订单页；请在手机核对，程序不会重复点击。");
+            return;
+        }
+    }
+    function preparedLayout() {
+        return has("选择票档") || exactNodes(["场次"]).length === 1 &&
+            exactNodes(["票档"]).length === 1;
+    }
+    function preparedLayoutWithIdentity() {
+        return preparedLayout() && has(TARGET.titleToken) && has(TARGET.city);
+    }
+    function verifyPrepared(reuseDecision) {
+        if (!reuseDecision) checkPackage(USER_PRESELECTED ? "prepared" : false);
+        verifyDetail(false, true);
+        if (!preparedLayout() || has("请选择票档")) {
+            stop("预选页面状态已变化，已停止。");
+        }
+        if (!USER_PRESELECTED) {
+            var date = unique(dateNodes(), "预选场次");
+            var tier = unique(priceNodes(), "预选票档");
+            if (!nodeAlreadySelected(date) || !nodeAlreadySelected(tier)) {
+                stop("未能确认预选场次与票档均为目标，已停止；请在手机核对。");
+            }
+        }
+        var counts = matchingPattern(/\d+\s*(?:张|份)/, false);
+        for (var i = 0; i < counts.length; i++) {
+            var value = counts[i].label.match(/(\d+)\s*(?:张|份)/);
+            if (value && Number(value[1]) !== 1) stop("预选票数不是 1 张，已停止。");
+        }
+    }
+    function preparedActions() {
+        return exactNodes(ENTRY.concat(SKU_CONFIRM));
+    }
+    function runPreparedStart() {
+        verifyPrepared(false);
+        mark("已核对预选页面");
+        if (PRECHECK_ONLY || SELECTION_REHEARSAL) {
+            report("预选页面已核对；当前检查模式不点击、不提交。");
+            return;
+        }
+        // Preserve the prepared sheet rather than opening it again.
+        // Missing or disabled controls are observed, never repeatedly tapped.
+        while (Date.now() < TARGET.saleEpochMs) {
+            var remaining = TARGET.saleEpochMs - Date.now();
+            pauseAfterRead(Math.min(remaining > 30000 ? 1000 :
+                                   remaining > 3000 ? 200 : 20, remaining));
+            verifyPrepared(false);
+        }
+        var deadline = Date.now() + 60000;
+        var action = null;
+        while (Date.now() < deadline) {
+            var candidates = preparedActions();
+            if (candidates.length > 1) stop("预选页推进按钮不唯一，已停止。");
+            if (candidates.length === 1 && candidates[0].enabled()) {
+                action = candidates[0];
+                break;
+            }
+            pauseAfterRead(20);
+            verifyPrepared(false);
+        }
+        if (action === null) stop("预选页推进按钮未及时可用，已停止。");
+        var confirmation = SKU_CONFIRM.indexOf(action.label) >= 0;
+        var actionLabel = action.label;
+        entryFoundEpochMs = Date.now();
+        clickFresh("购票入口", preparedActions, function () {
+            // In user-preselected mode this snapshot was just read by the
+            // readiness loop, with button bounds/state. No intervening wait.
+            verifyPrepared(USER_PRESELECTED);
+            if (unique(preparedActions(), "预选推进").label !== actionLabel) {
+                stop("预选推进动作已变化，已停止。");
+            }
+            if (confirmation) {
+                unique(exactNodes(["1张", "1 张", "1份", "1 份"]), "预选确认票数");
+                safeButtonBounds(unique(preparedActions(), "预选确认"), "票档确认");
+            }
+        }, claimAttempt);
+        mark("从预选页面直接推进");
+        var orderDeadline = Date.now() + 8000;
+        while (Date.now() < orderDeadline) {
+            var preparedKind = pageKind();
+            if (preparedKind === "order") {
+                finishAtOrder();
+                return;
+            }
+            // A reservation entry can open the actual SKU sheet first.
+            // A confirmation already tapped must never be tapped again.
+            if (!confirmation && preparedKind === "sku" && !preparedLayoutWithIdentity()) {
+                continueSkuFlow();
+                return;
+            }
+            pauseAfterRead(20);
+        }
+        stop("预选页已点击一次但订单页未确认，已停止；不会重复点击。");
+    }
+    function continueUserSelectedSku() {
+        var readyDeadline = Date.now() + 2000;
+        while (Date.now() < readyDeadline) {
+            checkPackage("prepared");
+            var kind = pageKind(true);
+            if (kind === "order") { finishAtOrder(); return; }
+            if (kind === "sku" && !has("请选择票档") &&
+                    exactNodes(["1张", "1 张", "1份", "1 份"]).length === 1 &&
+                    confirmationNodes().length === 1) {
+                clickFresh("票档确认", confirmationNodes, function () {
+                    checkBlockers();
+                    unique(exactNodes(["1张", "1 张", "1份", "1 份"]), "用户预选票数");
+                });
+                var orderDeadline = Date.now() + 8000;
+                while (Date.now() < orderDeadline) {
+                    if (pageKind() === "order") { finishAtOrder(); return; }
+                    pauseAfterRead(20);
+                }
+                stop("已确认用户预选，但订单页未确认，已停止；不重复点击。");
+            }
+            pauseAfterRead(20);
+        }
+        stop("用户预选尚未使确认按钮就绪，已停止；不会切换场次或票档。");
     }
     function claimAttempt() {
         // Java File.createNewFile is atomic across two script engines. A
@@ -416,9 +957,46 @@ var FLOW_PRECHECK_ONLY = false;
         if (SELECTION_REHEARSAL) timeOrigin = Date.now();
         if (FLOW_PRECHECK_ONLY) {
             timeOrigin = Date.now();
+            readOrderFields = true;
             checkPackage();
             if (nameDigest("qiangpiao") !== "571ca4acfff4ab88e8e95a21b5ef78cc614c1ca65de69db58a108fdd4bb671f2") {
                 stop("手机端姓名摘要校验异常，已停止只读检查。");
+            }
+            if (CONGESTION_PRECHECK_ONLY) {
+                if (hasAny(CHALLENGE)) stop("只读拥堵检查发现验证，请在手机处理；未点击。");
+                if (hasAny(PAYMENT)) stop("只读拥堵检查发现支付页；未点击。");
+                var buttons = exactNodes(["刷新"]);
+                congestionProbe = {
+                    present: hasCongestion(),
+                    targetMatches: orderIdentityMatches() || has("选择票档") && dateNodes().length === 1,
+                    refreshCandidates: buttons.length,
+                    refreshEnabled: buttons.length === 1 && buttons[0].enabled(),
+                    validBounds: false
+                };
+                if (buttons.length === 1) {
+                    safeButtonBounds(buttons[0], "拥堵刷新");
+                    congestionProbe.validBounds = true;
+                }
+                mark("拥堵弹窗只读检查完成");
+                report(congestionProbe.present && congestionProbe.targetMatches &&
+                    congestionProbe.refreshEnabled && congestionProbe.validBounds ?
+                    "只读检查：目标拥堵弹窗与唯一可用刷新按钮已识别；未点击。" :
+                    "只读检查：当前未满足自动刷新识别条件；未点击。");
+                return;
+            }
+            var probeDates = dateNodes(), probeTiers = priceNodes();
+            preparedProbe = {
+                layout: preparedLayout(),
+                titleMatches: has(TARGET.titleToken), cityMatches: has(TARGET.city),
+                dateCandidates: probeDates.length, tierCandidates: probeTiers.length,
+                dateSelected: probeDates.length === 1 && nodeAlreadySelected(probeDates[0]),
+                tierSelected: probeTiers.length === 1 && nodeAlreadySelected(probeTiers[0])
+            };
+            if (preparedLayout() && has(TARGET.titleToken) && has(TARGET.city)) {
+                verifyPrepared(true);
+                mark("预选页面只读检查完成");
+                report("只读检查通过：预选演出、场次、票档及选中状态已匹配；未点击。");
+                return;
             }
             var probeKind = pageKind(true);
             if (probeKind === "order") {
@@ -436,7 +1014,9 @@ var FLOW_PRECHECK_ONLY = false;
             }
             return;
         }
-        checkPackage();
+        // Detail preflight only needs labels. Geometry is fetched at the
+        // fresh pre-click validation, not during the initial identity check.
+        checkPackage(true);
         var now = Date.now();
         if (!PRECHECK_ONLY && !SELECTION_REHEARSAL &&
                 (now < TARGET.saleEpochMs - 600000 || now > TARGET.saleEpochMs + 1200000)) {
@@ -446,16 +1026,29 @@ var FLOW_PRECHECK_ONLY = false;
         if (!SELECTION_REHEARSAL && storage.contains(TARGET.attemptKey)) {
             stop("这场演出已有一次手机端选档尝试；请核对猫眼页面。");
         }
-        verifyDetail(!SELECTION_REHEARSAL && now < TARGET.saleEpochMs);
+        if (preparedLayout()) {
+            runPreparedStart();
+            return;
+        }
+        verifyDetail(!SELECTION_REHEARSAL && now < TARGET.saleEpochMs, true);
+        var reuseInitialEntryDecision = SELECTION_REHEARSAL || now >= TARGET.saleEpochMs;
         if (PRECHECK_ONLY) {
             console.log("猫眼手机端预检通过：演出、城市和预约状态已识别；未点击。");
             return;
         }
         while (!SELECTION_REHEARSAL && Date.now() < TARGET.saleEpochMs) {
-            checkPackage();
+            checkPackage(true);
+            verifyDetail(false, true);
             var remaining = TARGET.saleEpochMs - Date.now();
-            sleep(Math.min(remaining > 30000 ? 1000 :
-                           remaining > 3000 ? 200 : 50, remaining));
+            if (remaining <= 0) {
+                // This read itself crossed the sale time. Search its labels
+                // immediately instead of reading the same detail page again.
+                // A read before sale followed by sleep must never use this path.
+                reuseInitialEntryDecision = true;
+                break;
+            }
+            pauseAfterRead(Math.min(remaining > 30000 ? 1000 :
+                                   remaining > 3000 ? 200 : 20, remaining));
         }
         mark(SELECTION_REHEARSAL ? "选档演练开始" : "开售等待结束");
 
@@ -465,24 +1058,38 @@ var FLOW_PRECHECK_ONLY = false;
         var entryDeadline = Date.now() + (SELECTION_REHEARSAL ? 5000 : 60000);
         var entryNode = null;
         while (Date.now() < entryDeadline) {
-            checkPackage();
+            // Search labels first; geometry and state are fetched only when
+            // a candidate exists. Every action still gets a fresh full tree.
+            // When already on sale, the initial preflight is also the first
+            // entry search. This is a decision-only reuse: the actual tap
+            // still re-reads and validates the live page below.
+            if (!reuseInitialEntryDecision) checkPackage(true);
+            reuseInitialEntryDecision = false;
+            verifyDetail(false, true);
             var possibleEntry = entryNodes();
             if (possibleEntry.length > 1) stop("购票入口出现多个候选，已停止。");
             if (possibleEntry.length === 1) {
-                entryNode = possibleEntry[0];
-                break;
+                entryFoundEpochMs = Date.now();
+                // This is the final fresh pre-click read. A label can appear
+                // before its control becomes enabled; observe rather than abort.
+                verifyDetail(false, false, true);
+                var freshEntries = entryNodes();
+                if (freshEntries.length > 1) stop("购票入口出现多个候选，已停止。");
+                if (freshEntries.length === 1 && freshEntries[0].enabled()) {
+                    entryNode = freshEntries[0];
+                    break;
+                }
             }
-            sleep(80);
+            pauseAfterRead(20);
         }
         if (!entryNode) stop("开售后未找到唯一购票入口，已停止。");
         mark("发现购票入口");
 
-        // Re-read the live control and mark the attempt before the first action.
-        entryNode = unique(entryNodes(), "购票入口");
-        safeButtonBounds(entryNode, "购票入口");
-        if (!SELECTION_REHEARSAL) claimAttempt();
+        // The loop just read the live control. No sleep or page action occurs
+        // between that read and this touch; do not fetch it a third time.
         clickFresh("购票入口", entryNodes,
-            function () { verifyDetail(false); });
+            function () { verifyDetail(false, true); },
+            function () { if (!SELECTION_REHEARSAL) claimAttempt(); });
         mark("点击购票入口");
 
         var kind = waitForKind(5000);
@@ -492,67 +1099,8 @@ var FLOW_PRECHECK_ONLY = false;
             return;
         }
         if (kind === "sku") {
-            if (!targetDateAlreadySelected()) {
-                clickFresh("目标日期", dateNodes, function () {
-                    if (pageKind() !== "sku") stop("目标日期选择页已变化，已停止。");
-                });
-                mark("点击目标日期");
-                sleep(100);
-            } else mark("沿用已选日期");
-            if (pageKind() === "order") {
-                finishAtOrder();
-                return;
-            }
-            else {
-                if (!has("请选择票档")) {
-                    if (!nodeAlreadySelected(unique(priceNodes(), "已选目标票档"))) {
-                        stop("票档页已有选择，但未确认是目标金额，请在手机核对。");
-                    }
-                    mark("沿用已选票档");
-                } else {
-                    clickFresh("目标票档", priceNodes, function () {
-                        if (pageKind() !== "sku") stop("目标票档选择页已变化，已停止。");
-                    });
-                    mark("点击目标票档");
-                }
-                var choiceDeadline = Date.now() + 700;
-                while (Date.now() < choiceDeadline) {
-                    checkPackage();
-                    checkBlockers();
-                    if (!has("请选择票档")) break;
-                    sleep(40);
-                }
-                if (has("请选择票档")) {
-                    stop("目标票档未被选中或已不可售，已停止。");
-                }
-                var selectedPage = pageKind();
-                if (selectedPage !== "sku" && selectedPage !== "order") {
-                    stop("票档点击后页面状态不明确，已停止；请在手机核对。");
-                }
-                mark("票档按钮已更新");
-                if (selectedPage === "order") {
-                    finishAtOrder();
-                    return;
-                }
-                if (SELECTION_REHEARSAL) {
-                    report("选档演练已点中目标票档；未点击确认，请在猫眼核对。");
-                    return;
-                }
-                clickFresh("票档确认", confirmationNodes,
-                    verifySelectedSku);
-                mark("点击票档确认");
-                var orderDeadline = Date.now() + 4000;
-                while (Date.now() < orderDeadline) {
-                    if (pageKind() === "order") {
-                        mark("到达订单页");
-                        finishAtOrder();
-                        return;
-                    }
-                    sleep(80);
-                }
-                stop("已点击票档确认，但未确认进入订单页；请在手机核对，程序不会重复点击。");
-                return;
-            }
+            continueSkuFlow();
+            return;
         }
         stop("未识别到目标选票页，已停止。");
     } catch (error) {
