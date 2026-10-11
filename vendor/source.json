@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/currycan/HaTickets",
+  "tag": "v0.5.0",
+  "commit": "ded263ff70f16dca672573c288cfb02b93f33dc1",
+  "license": "Apache-2.0",
+  "source_archive": "https://codeload.github.com/currycan/HaTickets/zip/refs/tags/v0.5.0",
+  "local_patch": "mobile/damai_app/orchestrator.py: unmatched target date stops instead of choosing fallback session",
+  "date": "2026-10-01"
+}

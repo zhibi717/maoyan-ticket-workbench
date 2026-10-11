@@ -1,0 +1,499 @@
+# -*- coding: UTF-8 -*-
+"""
+PageProbe — fast page-state detection for Damai mobile automation.
+
+Provides two probe modes:
+- **Fast probe** (~100ms): checks only the Android Activity name.
+- **Full probe** (~1.5s): checks element resource IDs for comprehensive state.
+
+Results are cached with a configurable TTL to avoid redundant device queries.
+"""
+
+import os
+import time
+from enum import Enum
+from typing import Any, Dict, Optional, Union
+
+try:
+    from mobile.logger import get_logger
+except ImportError:
+    from logger import get_logger
+
+logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Page state enum (P1 #25, Step 1)
+# ---------------------------------------------------------------------------
+# Inherits ``str`` so existing string-based comparisons (``state == "sku_page"``)
+# keep working without churn while new code can use ``PageState.SESSION_PICKER``.
+class PageState(str, Enum):
+    HOMEPAGE = "homepage"
+    SEARCH_PAGE = "search_page"
+    DETAIL_PAGE = "detail_page"
+    SKU_PAGE = "sku_page"
+    SESSION_PICKER = "session_picker"
+    ORDER_CONFIRM_PAGE = "order_confirm_page"
+    CONSENT_DIALOG = "consent_dialog"
+    PENDING_ORDER_DIALOG = "pending_order_dialog"
+    UNKNOWN = "unknown"
+
+
+# Markers used to recognise the multi-session date picker on the SKU page.
+_SESSION_PICKER_RESOURCE_IDS = ("cn.damai:id/sku_panel_dates",)
+_SESSION_PICKER_TEXTS = (
+    "请选择场次",
+    "选择日期",
+    "请选择日期",
+    "请选择演出日期",
+)
+
+
+# ---------------------------------------------------------------------------
+# Price panel state detection (P1 #31, Step 3)
+# ---------------------------------------------------------------------------
+
+# Resource IDs / text patterns checked when classifying the price panel state.
+_PRICE_LOADING_INDICATORS = (
+    "cn.damai:id/loading_progress",
+    "cn.damai:id/sku_loading",
+    "cn.damai:id/loading_view",
+)
+_PRICE_READY_CONTAINERS = (
+    "cn.damai:id/project_detail_perform_price_flowlayout",
+    "cn.damai:id/layout_price",
+)
+_PRICE_SOLD_OUT_TEXTS = (
+    "已售罄",
+    "全部售罄",
+    "无票",
+    "暂无可售票档",
+    "缺货登记",
+)
+
+
+def _safe_exists(driver: Any, **selector: Any) -> bool:
+    """Return ``driver(**selector).exists`` swallowing any device error."""
+    try:
+        return bool(driver(**selector).exists)
+    except Exception:
+        return False
+
+
+def detect_price_panel_state(driver: Any) -> str:
+    """Classify the visible price panel state.
+
+    Returns one of: ``"loading"``, ``"ready"``, ``"sold_out"``, ``"unknown"``.
+
+    The order is intentional:
+      1. ``loading`` — a loading spinner is present, caller should wait briefly.
+      2. ``sold_out`` — visible text matches a sold-out marker.
+      3. ``ready`` — a known price container resource-id exists.
+      4. ``unknown`` — none of the above; caller should fall back gracefully.
+    """
+    # 1. loading spinner takes priority — the panel may render later
+    for resource_id in _PRICE_LOADING_INDICATORS:
+        if _safe_exists(driver, resourceId=resource_id):
+            return "loading"
+
+    # 2. sold-out markers (text/textContains) — never try to click empty cards
+    for text in _PRICE_SOLD_OUT_TEXTS:
+        if _safe_exists(driver, text=text) or _safe_exists(driver, textContains=text):
+            return "sold_out"
+
+    # 3. ready when a known price container is present
+    for container_id in _PRICE_READY_CONTAINERS:
+        if _safe_exists(driver, resourceId=container_id):
+            return "ready"
+
+    return "unknown"
+
+
+# Activity substrings → state mapping (used by fast probe)
+_ACTIVITY_STATE_MAP = (
+    ("ProjectDetail", "detail_page"),
+    ("NcovSku", "sku_page"),
+    ("MainActivity", "homepage"),
+    ("SearchActivity", "search_page"),
+)
+
+# 详情页价格区容器候选（多版本兼容）：大麦 9.0.2x 详情页已移除
+# project_detail_price_layout，价格区改为 info_v2_price_layout（2026-07-11
+# 真机 dump 证实）。新 ID 在前，现网主流版本一次命中少一次元素查询。
+_DETAIL_PRICE_LAYOUT_IDS = (
+    "cn.damai:id/info_v2_price_layout",
+    "cn.damai:id/project_detail_price_layout",
+)
+
+# Default result template
+_DEFAULT_RESULT: Dict[str, Any] = {
+    "state": "unknown",
+    "purchase_button": False,
+    "price_container": False,
+    "quantity_picker": False,
+    "submit_button": False,
+    "reservation_mode": False,
+    "pending_order_dialog": False,
+}
+
+
+def _make_result(**overrides: Any) -> Dict[str, Any]:
+    """Create a fresh result dict with optional overrides (immutable pattern)."""
+    return {**_DEFAULT_RESULT, **overrides}
+
+
+class PageProbe:
+    """Detects the current page state of the Damai app on an Android device.
+
+    Args:
+        device: A uiautomator2 device connection (or compatible mock).
+        config: Optional mobile Config instance (reserved for future use).
+        cache_ttl_s: How long (seconds) a cached probe result stays valid.
+    """
+
+    def __init__(
+        self,
+        device: Any,
+        config: Any = None,
+        cache_ttl_s: float = 0.5,
+        *,
+        unknown_threshold: int = 3,
+        dump_dir: str = "tmp",
+    ) -> None:
+        self._device = device
+        self._config = config
+        self._bot = None
+        self._cache_ttl_s = cache_ttl_s
+        self._cached_result: Optional[Dict[str, Any]] = None
+        self._cached_at: float = 0.0
+        # P2 #24 — consecutive-unknown alerting
+        self._unknown_threshold = max(1, int(unknown_threshold))
+        self._consecutive_unknown_count = 0
+        self._dump_dir = dump_dir
+        self.dumped_xml_path: Optional[str] = None
+        # P2 #24 — recovery override
+        self._forced_state: Optional[str] = None
+
+    def set_bot(self, bot) -> None:
+        """Set DamaiBot reference for delegation (e.g. reservation_mode check)."""
+        self._bot = bot
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def probe_current_page(self, fast: bool = False) -> Dict[str, Any]:
+        """Detect the current page state.
+
+        Args:
+            fast: When True, only inspect the Activity name (~100ms).
+                  When False, also check UI elements for full state (~1.5s).
+
+        Returns:
+            A dict describing the page state and key element presence.
+        """
+        # P2 #24 — recovery short-circuit: if a known state has been forced,
+        # return it without touching the device.
+        if self._forced_state is not None:
+            result = _make_result(state=self._forced_state)
+            self._cached_result = result
+            self._cached_at = time.time()
+            return result
+
+        now = time.time()
+        if (
+            self._cached_result is not None
+            and (now - self._cached_at) < self._cache_ttl_s
+        ):
+            logger.debug(
+                "page probe: returning cached result (age=%.3fs)", now - self._cached_at
+            )
+            return self._cached_result
+
+        if fast:
+            result = self._probe_fast()
+        else:
+            result = self._probe_full()
+
+        self._cached_result = result
+        self._cached_at = time.time()
+        self._track_unknown(result)
+        return result
+
+    def force_state(self, state: Optional[Union["PageState", str]]) -> None:
+        """Force the probe to return a known state on subsequent calls.
+
+        Used by recovery modules that have external knowledge of the current
+        page (e.g. just dismissed a dialog and know we are back on detail_page)
+        to bypass the slower element-based classification.
+
+        Pass ``None`` to clear the override and resume normal probing.
+        """
+        if state is None:
+            self._forced_state = None
+            self.invalidate_cache()
+            logger.info("PageProbe.force_state: cleared override")
+            return
+        state_value = state.value if isinstance(state, PageState) else str(state)
+        self._forced_state = state_value
+        self._consecutive_unknown_count = 0
+        self.invalidate_cache()
+        logger.info("PageProbe.force_state: %s", state_value)
+
+    def _track_unknown(self, result: Dict[str, Any]) -> None:
+        """Count consecutive unknown classifications and dump UI on threshold."""
+        if (result or {}).get("state") != PageState.UNKNOWN.value:
+            self._consecutive_unknown_count = 0
+            return
+        self._consecutive_unknown_count += 1
+        if self._consecutive_unknown_count == self._unknown_threshold:
+            logger.warning(
+                "UNKNOWN_THRESHOLD reached after %d classifications",
+                self._consecutive_unknown_count,
+            )
+            self.dumped_xml_path = self._dump_unknown_xml()
+
+    def _dump_unknown_xml(self) -> Optional[str]:
+        """Persist the current UI hierarchy to ``<dump_dir>/page_probe_unknown_<ts>.xml``.
+
+        Returns the file path on success, or ``None`` if dumping failed.
+        Failures never raise — alerting is best-effort.
+        """
+        try:
+            os.makedirs(self._dump_dir, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("page probe dump dir create failed: %s", exc)
+            return None
+        try:
+            xml = self._device.dump_hierarchy() or ""
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("page probe dump_hierarchy failed: %s", exc)
+            xml = ""
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self._dump_dir, f"page_probe_unknown_{ts}.xml")
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(xml)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("page probe dump write failed: %s", exc)
+            return None
+        return path
+
+    def classify(self, fast: bool = False) -> Dict[str, Any]:
+        """Public alias of :meth:`probe_current_page`.
+
+        Existing call sites use ``probe_current_page``; new code (P1 #25
+        multi-session flow) reads more naturally as ``probe.classify()``.
+        """
+        return self.probe_current_page(fast=fast)
+
+    def get_current_activity(self) -> str:
+        """Return the current foreground Activity name."""
+        try:
+            info = self._device.app_current()
+            return info.get("activity", "")
+        except Exception:
+            logger.warning("page probe: failed to get current activity")
+            return ""
+
+    def invalidate_cache(self) -> None:
+        """Clear the cached probe result so the next call queries the device."""
+        self._cached_result = None
+        self._cached_at = 0.0
+
+    # ------------------------------------------------------------------
+    # Internal: fast probe
+    # ------------------------------------------------------------------
+
+    def _probe_fast(self) -> Dict[str, Any]:
+        """Probe using only the Activity name (~100ms)."""
+        activity = self.get_current_activity()
+        logger.debug("page probe (fast): activity=%s", activity)
+
+        for substring, state in _ACTIVITY_STATE_MAP:
+            if substring in activity:
+                return _make_result(state=state)
+
+        # Activity not recognised — fall through to full probe
+        logger.debug("page probe (fast): unknown activity, falling back to full probe")
+        return self._probe_full()
+
+    # ------------------------------------------------------------------
+    # Internal: full probe
+    # ------------------------------------------------------------------
+
+    def _probe_full(self) -> Dict[str, Any]:
+        """Probe using Activity + element lookups for comprehensive state detection.
+
+        Strategy: check Activity name first (~5ms) to skip expensive element
+        lookups (~60ms each).  Only fall through to element checks for pages
+        without a distinct Activity (order_confirm, consent_dialog, pending_order).
+        """
+        activity = self.get_current_activity()
+        logger.debug("page probe (full): activity=%s", activity)
+
+        # ------------------------------------------------------------------
+        # Fast path: Activity-based detection with minimal confirmation
+        # ------------------------------------------------------------------
+        if "ProjectDetail" in activity:
+            purchase_bar = self._exists_by_resource_id(
+                "cn.damai:id/trade_project_detail_purchase_status_bar_container_fl"
+            )
+            # price_container 不能停留在默认 False：probe_only 就绪判定
+            # （orchestrator）依赖它，否则安全探测在 detail_page 上永远「未就绪」。
+            # 本探测发生在开售等待之前，不在点击临界路径上。
+            price_layout = any(
+                self._exists_by_resource_id(rid) for rid in _DETAIL_PRICE_LAYOUT_IDS
+            )
+            return _make_result(
+                state="detail_page",
+                purchase_button=purchase_bar,
+                price_container=price_layout,
+            )
+
+        if "NcovSku" in activity:
+            if self._has_session_picker_markers():
+                return _make_result(
+                    state=PageState.SESSION_PICKER.value,
+                    price_container=False,
+                )
+            reservation = self._check_reservation_mode()
+            return _make_result(
+                state="sku_page",
+                price_container=True,
+                quantity_picker=True,
+                reservation_mode=reservation,
+            )
+
+        if "MainActivity" in activity:
+            return _make_result(state="homepage")
+
+        if "SearchActivity" in activity:
+            return _make_result(state="search_page")
+
+        # ------------------------------------------------------------------
+        # Slow path: element-based detection for ambiguous Activities
+        # ------------------------------------------------------------------
+        logger.debug("page probe (full): activity not matched, starting element checks")
+
+        # Check consent dialog first (blocks everything else)
+        if self._exists_by_resource_id("cn.damai:id/id_boot_action_agree"):
+            return _make_result(state="consent_dialog")
+
+        # Check pending order dialog
+        pending = self._exists_by_text_contains("未支付订单")
+
+        # Check order confirm page (submit button)
+        submit = self._exists_by_text("立即提交")
+        checkbox = self._exists_by_resource_id("cn.damai:id/checkbox")
+        if submit or checkbox:
+            return _make_result(
+                state="order_confirm_page",
+                submit_button=submit,
+                pending_order_dialog=pending,
+            )
+
+        # Check SKU page (fallback for when Activity didn't match)
+        sku_layout = self._exists_by_resource_id("cn.damai:id/layout_sku")
+        sku_container = self._exists_by_resource_id("cn.damai:id/sku_contanier")
+        if sku_layout or sku_container:
+            if self._has_session_picker_markers():
+                return _make_result(
+                    state=PageState.SESSION_PICKER.value,
+                    pending_order_dialog=pending,
+                )
+            reservation = self._check_reservation_mode()
+            return _make_result(
+                state="sku_page",
+                quantity_picker=True,
+                pending_order_dialog=pending,
+                reservation_mode=reservation,
+            )
+
+        # Check detail page (fallback)
+        purchase_bar = self._exists_by_resource_id(
+            "cn.damai:id/trade_project_detail_purchase_status_bar_container_fl"
+        )
+        price_layout = any(
+            self._exists_by_resource_id(rid) for rid in _DETAIL_PRICE_LAYOUT_IDS
+        )
+        title_tv = self._exists_by_resource_id("cn.damai:id/title_tv")
+        if purchase_bar or price_layout or title_tv:
+            return _make_result(
+                state="detail_page",
+                purchase_button=purchase_bar,
+                price_container=price_layout,
+                pending_order_dialog=pending,
+            )
+
+        # Check homepage (fallback)
+        search_header = self._exists_by_resource_id(
+            "cn.damai:id/homepage_header_search"
+        )
+        search_btn = self._exists_by_resource_id(
+            "cn.damai:id/pioneer_homepage_header_search_btn"
+        )
+        if search_header or search_btn:
+            return _make_result(state="homepage", pending_order_dialog=pending)
+
+        # Check search page (fallback)
+        search_input = self._exists_by_resource_id("cn.damai:id/header_search_v2_input")
+        if search_input:
+            return _make_result(state="search_page", pending_order_dialog=pending)
+
+        # Check pending order as last resort
+        if pending:
+            return _make_result(state="unknown", pending_order_dialog=True)
+
+        return _make_result()
+
+    # ------------------------------------------------------------------
+    # Element existence helpers
+    # ------------------------------------------------------------------
+
+    def _exists_by_resource_id(self, resource_id: str) -> bool:
+        try:
+            el = self._device(resourceId=resource_id)
+            return el.exists
+        except Exception:
+            return False
+
+    def _exists_by_text(self, text: str) -> bool:
+        try:
+            el = self._device(text=text)
+            return el.exists
+        except Exception:
+            return False
+
+    def _exists_by_text_contains(self, text: str) -> bool:
+        try:
+            el = self._device(textContains=text)
+            return el.exists
+        except Exception:
+            return False
+
+    def _has_session_picker_markers(self) -> bool:
+        """Return True when the multi-session date picker UI is visible.
+
+        Detects the SKU panel state where the user must pick a session/date
+        before the price flow-layout becomes interactive. Markers checked:
+
+        - resource-id ``cn.damai:id/sku_panel_dates``
+        - text "请选择场次" / "选择日期" (and minor wording variants)
+        """
+        for resource_id in _SESSION_PICKER_RESOURCE_IDS:
+            if self._exists_by_resource_id(resource_id):
+                return True
+        for text in _SESSION_PICKER_TEXTS:
+            if self._exists_by_text(text) or self._exists_by_text_contains(text):
+                return True
+        return False
+
+    def _check_reservation_mode(self) -> bool:
+        """Check if the SKU page is in reservation (not purchase) mode."""
+        if self._bot is not None:
+            try:
+                return self._bot.is_reservation_sku_mode()
+            except Exception:
+                pass
+        return False

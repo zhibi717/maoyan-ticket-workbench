@@ -1,0 +1,59 @@
+{
+  // ── 设备连接 ──
+  // adb devices 显示的设备序列号（必填）
+  "serial": "你的设备序列号",
+
+  // ── 目标演出（必填）──
+  // 搜索关键词，用于在大麦 App 内搜索目标演出
+  "keyword": "张杰 演唱会",
+  // 精确标题/场馆（可选，run_from_prompt.sh 会自动生成）
+  "target_title": null,
+  "target_venue": null,
+
+  // ── 购票参数（必填，使用 App 页面上的原文）──
+  // 观演人姓名，需要先在大麦 App 里添加并保存；人数 = 购票数量
+  "users": ["你的真实观演人姓名"],
+  "city": "演出城市",
+  "date": "场次日期",
+  "price": "票档原文",
+  // 文本匹配失败时的兜底索引，从 0 开始数
+  "price_index": 0,
+
+  // ── 运行模式 ──
+  // probe_only=true  → 安全探测：停在"立即购票"前，不点击
+  // probe_only=false + if_commit_order=false → 开发验证：到确认页但不提交
+  // probe_only=false + if_commit_order=true  → 正式抢票：会提交订单
+  "probe_only": true,
+  "if_commit_order": false,
+
+  // ── 导航 ──
+  // 自动从首页搜索并导航到目标演出
+  "auto_navigate": true,
+
+  // ── 开售倒计时（可选）──
+  // 精确开抢时间（ISO 格式），例如 "2026-04-06T12:00:00+08:00"
+  "sell_start_time": null,
+  // 开抢前多少毫秒进入高频轮询
+  "countdown_lead_ms": 3000,
+  // CTA 等待模式：最多等待多少毫秒「立即购票」按钮从倒计时变为可点击。
+  // 0 = 不启用（已知精确开抢时间时推荐）；不知道精确时间、手动停在倒计时详情页时可设 60000。
+  "wait_cta_ready_timeout_ms": 0,
+
+  // ── 性能调优 ──
+  // 极速模式：信任 price_index 跳过冗余 UI 读取，推荐开启。
+  // rush_mode 是下面 3 个子开关的 alias；显式设置子开关可获更细控制。
+  "rush_mode": true,
+  // ── rush 子开关（rush_mode 的细粒度版本） ──
+  // 多场次活动跳过场次选择 → 永远不要在多场次场景开启（issue #25 根因）。
+  // 单场次活动可设 true 略微加速。即便此处填 true，多场次场景下系统也会
+  // 强制选场并 warning 日志。
+  "rush_skip_session": false,
+  // 价格选择失败时是否跳过 UI dump（dump 写到 tmp/price_dump_*.xml 帮助排查）
+  "rush_skip_price_dump": true,
+  // 失败后的激进快速重试（缩短退避、增加并发轮询）
+  "rush_aggressive_retry": true,
+  // 快速重试次数（不重建 driver）
+  "fast_retry_count": 8,
+  // 快速重试间隔（毫秒）
+  "fast_retry_interval_ms": 80
+}

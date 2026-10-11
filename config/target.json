@@ -1,0 +1,14 @@
+{
+  "event": "庾澄庆「整晚哈音乐」2026巡回演唱会－广州站",
+  "item_id": "1067013545958",
+  "event_time": "2026-11-14T19:00:00+08:00",
+  "sale_time": "2026-09-29T15:00:00+08:00",
+  "title_tokens": ["庾澄庆", "广州"],
+  "ticket_tier_cny": 480,
+  "allow_alternative_tiers": false,
+  "quantity": 1,
+  "mode": "one_real_order_manual_payment",
+  "submit_order": true,
+  "source_sale": "https://www.sina.cn/media/1589934555",
+  "source_item": "https://huodong.com/event/detail/eyagI"
+}

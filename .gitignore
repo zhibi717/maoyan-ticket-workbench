@@ -1,0 +1,17 @@
+# Local runtime and private data
+.venv/
+__pycache__/
+*.py[cod]
+data/*
+!data/.gitkeep
+.env
+.env.*
+*.log
+*.lock
+*.png
+*.jpg
+*.jpeg
+*.zip
+tools/platform-tools/*
+!tools/platform-tools/README.md
+.DS_Store
