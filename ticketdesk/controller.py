@@ -88,12 +88,10 @@ class Controller:
             profile = self.selected_profile()
             if profile['platform'] != 'maoyan':
                 raise ValueError('AutoX 手机端目前只支持猫眼目标。')
-            if not self.snapshot()['live_allowed']:
-                raise ValueError('请在开售前 10 分钟至开售后 20 分钟内启动 AutoX。')
             from .autox_phone import open_live_on_phone
             open_live_on_phone(profile)
-            self.state['status'] = '已在手机打开 AutoX 脚本；点“运行脚本”并切回目标页。选档、核对 1 张并确认后，会检查指定观演人的勾选状态。'
-            self.log('AutoX 脚本已打开；选档后点一次“确认”，在订单页检查指定观演人，后续由你操作。')
+            self.state['status'] = '已在手机打开 AutoX 脚本；点“运行脚本”并切回目标页。核对票档、1 张和指定观演人后，仅提交明确的订单按钮一次，尝试进入微信付款页后停止，不付款。'
+            self.log('AutoX 脚本已打开；核对订单及观演人后提交一次，尝试到微信付款页后停止；确认购票页支持立即支付；收银台需确认微信方式，进入微信后停止。')
 
     def open_autox_rehearsal(self):
         with self.lock:
@@ -106,6 +104,18 @@ class Controller:
             open_rehearsal_on_phone(profile)
             self.state['status'] = '手机已打开选档演练文件；运行后切回猫眼详情页。演练只选目标票档，不确认或提交订单。'
             self.log('AutoX 选档演练文件已打开；不会确认或提交订单。')
+
+    def open_autox_congestion_probe(self):
+        with self.lock:
+            if self.state['busy']:
+                raise ValueError('请先停止正在运行的任务。')
+            profile = self.selected_profile()
+            if profile['platform'] != 'maoyan':
+                raise ValueError('拥堵只读检查目前只支持猫眼。')
+            from .autox_phone import open_congestion_probe_on_phone
+            open_congestion_probe_on_phone(profile)
+            self.state['status'] = '已打开拥堵只读检查；运行后切回猫眼。仅检查弹窗和刷新按钮，不点击、不提交。'
+            self.log('拥堵只读检查已打开；不刷新、不提交、不支付。')
 
     def emit(self, kind, value):
         with self.lock:

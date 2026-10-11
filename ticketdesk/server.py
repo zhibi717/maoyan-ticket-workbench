@@ -93,6 +93,8 @@ class Handler(BaseHTTPRequestHandler):
                 controller.open_autox()
             elif self.path == '/api/autox/rehearsal/open':
                 controller.open_autox_rehearsal()
+            elif self.path == '/api/autox/congestion/probe':
+                controller.open_autox_congestion_probe()
             elif self.path == '/api/profile/save':
                 self.reply(200, {'profile': controller.save_profile(body)})
                 return

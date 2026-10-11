@@ -4,7 +4,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from .autox_live_export import (REHEARSAL_OUTPUT, build_live_script,
+from .autox_live_export import (REHEARSAL_OUTPUT, CONGESTION_PROBE_OUTPUT, build_wechat_script,
+                                build_congestion_probe_script,
                                 build_selection_rehearsal_script)
 from .paths import DATA, ROOT
 
@@ -30,7 +31,7 @@ def _run(args: list[str]) -> str:
 def open_live_on_phone(profile: dict, *, adb: Path = ADB, output: Path = OUTPUT,
                        run=_run) -> None:
     """Prepare and open the file; the user taps Run and returns to Maoyan."""
-    _open_script_on_phone(profile, build_live_script(profile), adb=adb,
+    _open_script_on_phone(profile, build_wechat_script(profile), adb=adb,
                           output=output, phone_output=PHONE_OUTPUT, run=run)
 
 
@@ -40,6 +41,13 @@ def open_rehearsal_on_phone(profile: dict, *, adb: Path = ADB,
     _open_script_on_phone(profile, build_selection_rehearsal_script(profile),
                           adb=adb, output=output,
                           phone_output=REHEARSAL_PHONE_OUTPUT, run=run)
+
+
+def open_congestion_probe_on_phone(profile: dict, *, adb: Path = ADB,
+                                   output: Path = CONGESTION_PROBE_OUTPUT, run=_run) -> None:
+    """Open the read-only congestion inspector; it never refreshes or orders."""
+    _open_script_on_phone(profile, build_congestion_probe_script(profile), adb=adb,
+                          output=output, phone_output='/sdcard/Download/autox-maoyan-congestion-probe.js', run=run)
 
 
 def _open_script_on_phone(profile: dict, script: str, *, adb: Path, output: Path,
