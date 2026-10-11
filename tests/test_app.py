@@ -189,6 +189,19 @@ class ApiTests(unittest.TestCase):
                 self.assertTrue(json.load(response)['ok'])
         open_phone.assert_called_once()
 
+    def test_capture_route_is_authenticated_and_preserves_selected_source(self):
+        profile = {**PROFILE, 'platform': 'maoyan', 'users': ['测试甲'], 'selection_source': 'phone'}
+        with self.request('/api/profile/save', profile):
+            pass
+        with patch('ticketdesk.autox_phone.open_selection_capture_on_phone') as open_phone:
+            with self.assertRaises(urllib.error.HTTPError) as exc:
+                self.request('/api/autox/selection/capture', {}, token=False)
+            self.assertEqual(exc.exception.code, 403)
+            open_phone.assert_not_called()
+            with self.request('/api/autox/selection/capture', {}) as response:
+                self.assertTrue(json.load(response)['ok'])
+            self.assertEqual(open_phone.call_args.args[0]['selection_source'], 'phone')
+
     def test_maoyan_usb_order_route_is_disabled(self):
         profile = {**PROFILE, 'platform': 'maoyan', 'users': ['测试甲'],
                    'sale_time': '2026-10-20T15:00:00+08:00'}
@@ -211,6 +224,16 @@ class ApiTests(unittest.TestCase):
 
 
 class ProfileTests(unittest.TestCase):
+    def test_selection_source_is_saved_and_legacy_profiles_keep_workbench_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp)/'profiles.json')
+            old = store.save(PROFILE)
+            self.assertEqual(old['selection_source'], 'workbench')
+            new = store.save({**old, 'selection_source': 'phone'})
+            self.assertEqual(store.get(new['id'])['selection_source'], 'phone')
+            with self.assertRaises(ValueError):
+                store.save({**old, 'selection_source': 'unknown'})
+
     def test_maps_to_upstream_modes_and_multiple_users(self):
         with tempfile.TemporaryDirectory() as tmp:
             p=ProfileStore(Path(tmp)/'profiles.json').save(PROFILE)
@@ -357,3 +380,4 @@ class MaoyanAdapterTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

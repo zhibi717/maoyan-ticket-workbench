@@ -17,6 +17,7 @@ LIVE_OUTPUT = DATA / 'autox-maoyan-live.js'
 REHEARSAL_OUTPUT = DATA / 'autox-maoyan-rehearsal.js'
 FLOW_PROBE_OUTPUT = DATA / 'autox-maoyan-flow-probe.js'
 CONGESTION_PROBE_OUTPUT = DATA / 'autox-maoyan-congestion-probe.js'
+CAPTURE_OUTPUT = DATA / 'autox-maoyan-selection-capture.js'
 
 
 def build_locked_prototype(profile: dict, template: str | None = None) -> str:
@@ -38,6 +39,11 @@ def build_locked_prototype(profile: dict, template: str | None = None) -> str:
         'attendeeNameSha256': hashlib.sha256(attendee.strip().encode('utf-8')).hexdigest(),
         'saleEpochMs': sale_ms,
         'attemptKey': f'{identifier}:{sale_ms}',
+        'selectionSource': profile.get('selection_source', 'workbench'),
+        'tierLabel': profile['price'],
+        'selectionKey': 'selection:' + hashlib.sha256(json.dumps(
+            [identifier, sale_ms, event, profile['price']], sort_keys=True
+        ).encode('utf-8')).hexdigest(),
     }
     template = TEMPLATE.read_text(encoding='utf-8') if template is None else template
     if (template.count(PLACEHOLDER) != 1 or
@@ -106,6 +112,15 @@ def build_congestion_probe_script(profile: dict, template: str | None = None) ->
     return script.replace(gate, 'var CONGESTION_PRECHECK_ONLY = true;', 1)
 
 
+def build_selection_capture_script(profile: dict, template: str | None = None) -> str:
+    """Record only explicit selected date/tier/quantity; never tap or lock an attempt."""
+    script = build_flow_probe_script(profile, template)
+    gate = 'var CAPTURE_SELECTION_ONLY = false;'
+    if script.count(gate) != 1:
+        raise RuntimeError('手机端记录预选开关异常。')
+    return script.replace(gate, 'var CAPTURE_SELECTION_ONLY = true;', 1)
+
+
 def export_live_selected(*, selection: Path = SELECTION,
                          store: ProfileStore | None = None,
                          output: Path = LIVE_OUTPUT) -> Path:
@@ -128,3 +143,4 @@ if __name__ == '__main__':
         print(f'已生成猫眼 AutoX 本机运行文件：{export_live_selected()}')
     except (ValueError, RuntimeError) as exc:
         raise SystemExit(str(exc)) from None
+

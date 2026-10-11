@@ -27,6 +27,9 @@ def validate_profile(value):
     date = field('date', 80)
     event_time_text = field('event_time', 50)
     price = field('price', 80)
+    selection_source = value.get('selection_source', 'workbench')
+    if selection_source not in ('phone', 'workbench'):
+        raise ValueError('请选择手机预选或工作台填写的票档来源。')
     if not re.search(r'\d', price):
         raise ValueError('票档请填写所选平台页面原文和金额。')
     amount_match = re.search(r'(?<!\d)(\d{2,5})(?!\d)', price)
@@ -68,6 +71,7 @@ def validate_profile(value):
     return dict(id=identifier, platform=platform, title=title, keyword=keyword, city=city, date=date,
                 event_time=event_time.isoformat(),
                 price=price, amount=amount, users=users, sale_time=sale.isoformat(),
+                selection_source=selection_source,
                 price_index=index, serial=serial.strip(), target_title=target_title.strip(),
                 target_venue=target_venue.strip())
 

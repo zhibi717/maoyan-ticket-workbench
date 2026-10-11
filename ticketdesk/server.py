@@ -91,6 +91,8 @@ class Handler(BaseHTTPRequestHandler):
                 controller.start(body.get('mode', 'simulation'), body.get('scenario', 'captcha'))
             elif self.path == '/api/autox/open':
                 controller.open_autox()
+            elif self.path == '/api/autox/selection/capture':
+                controller.open_autox_selection_capture()
             elif self.path == '/api/autox/rehearsal/open':
                 controller.open_autox_rehearsal()
             elif self.path == '/api/autox/congestion/probe':
@@ -170,3 +172,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

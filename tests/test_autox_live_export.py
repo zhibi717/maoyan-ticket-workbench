@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 
 from ticketdesk.autox_live_export import (build_flow_probe_script, build_live_script, build_locked_prototype,
-                                          build_selection_rehearsal_script, build_payment_script, build_congestion_probe_script, build_wechat_script)
+                                          build_selection_rehearsal_script, build_payment_script, build_congestion_probe_script, build_wechat_script,
+                                          build_selection_capture_script)
 from ticketdesk.autox_phone import open_live_on_phone, open_rehearsal_on_phone
 from ticketdesk.profiles import validate_profile
 
@@ -28,7 +29,8 @@ RAW_PROFILE = {
 
 
 class AutoXLiveExportTests(unittest.TestCase):
-    def simulate(self, scenario, *, rehearsal=False, probe=False, payment=False, congestion_probe=False, wechat=False):
+    def simulate(self, scenario, *, rehearsal=False, probe=False, payment=False, congestion_probe=False, wechat=False,
+                 capture=False, amount=1380, source='workbench', initial_storage=None):
         node = shutil.which('node')
         if not node:
             self.skipTest('Node.js is needed for offline AutoX mock')
@@ -41,12 +43,20 @@ class AutoXLiveExportTests(unittest.TestCase):
             builder = build_congestion_probe_script
         if wechat:
             builder = build_wechat_script
-        script = builder(validate_profile(RAW_PROFILE))
+        if capture:
+            builder = build_selection_capture_script
+        raw = {**RAW_PROFILE, 'price': f'看台 {amount} 元', 'selection_source': source}
+        script = builder(validate_profile(raw))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'synthetic-only.js'
             path.write_text(script, encoding='utf-8')
             harness = Path(__file__).with_name('autox_live_mock.js')
-            run = subprocess.run([node, str(harness), str(path), scenario],
+            args = [node, str(harness), str(path), scenario]
+            if initial_storage is not None:
+                storage = Path(tmp) / 'private-capture.json'
+                storage.write_text(json.dumps(initial_storage), encoding='utf-8')
+                args.append(str(storage))
+            run = subprocess.run(args,
                                  capture_output=True, text=True,
                                  encoding='utf-8', errors='replace')
             self.assertEqual(run.returncode, 0, run.stderr)
@@ -61,15 +71,14 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertEqual(failed['clicks'], [])
         self.assertEqual(failed['state'], 'detail')
 
-    def test_user_preselected_order_accepts_actual_price_instead_of_profile(self):
+    def test_unknown_actual_order_price_is_not_adopted_as_user_choice(self):
         outcome = self.simulate('wechat_preselected_price', wechat=True)
-        self.assertEqual(outcome['clicks'], ['立即购票', '提交订单'])
-        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'wechat_payment_page')
+        self.assertEqual(outcome['clicks'], ['立即购票'])
+        self.assertNotIn('提交订单', outcome['clicks'])
 
     def test_cashier_must_match_actual_submitted_price(self):
         outcome = self.simulate('wechat_preselected_price_changed', wechat=True)
-        self.assertEqual(outcome['clicks'], ['立即购票', '提交订单'])
-        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'cashier_manual_required')
+        self.assertEqual(outcome['clicks'], ['立即购票'])
 
     def test_wechat_direct_and_cashier_routes_stop_without_final_payment(self):
         for scenario, clicks in [
@@ -318,17 +327,61 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertEqual(outcome['clicks'], ['立即购票', '确认'])
         self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'not_submitted')
 
-    def test_user_preselected_fast_start_ignores_missing_native_selection_flags(self):
+    def test_prepared_start_requires_selection_evidence(self):
         outcome = self.simulate('prepared_unselected', wechat=True)
-        self.assertEqual(outcome['clicks'], ['确认', '提交订单'])
-        self.assertEqual(outcome['stateReads']['prepared'], 2)
-        self.assertEqual(outcome['geometryReads']['prepared'], 1)
+        self.assertEqual(outcome['clicks'], [])
         self.assertFalse(outcome['diagnosticWrites'][-1]['data']['automaticPayment'])
 
     def test_user_preselected_never_switches_tier_on_intermediate_sku(self):
         outcome = self.simulate('prepared_to_sku', wechat=True)
         self.assertEqual(outcome['clicks'], ['立即购票', '确认', '提交订单'])
         self.assertNotIn('看台 ¥1380', outcome['clicks'])
+
+    def test_any_configured_tier_is_reselected_when_reservation_is_lost(self):
+        for amount in [480, 580, 780, 1380, 2380]:
+            with self.subTest(amount=amount):
+                result = self.simulate('sku_preselected', wechat=True, amount=amount)
+                self.assertEqual(result['clicks'], ['立即购票', f'看台 ¥{amount}', '确认', '提交订单'])
+                self.assertEqual(result['state'], 'payment')
+
+    def test_recorded_phone_tier_overrides_placeholder_and_reselects_after_entry(self):
+        result = self.simulate('phone_valid', wechat=True, source='phone')
+        self.assertEqual(result['clicks'], ['立即购票', '看台 ¥580', '确认', '提交订单'])
+        self.assertNotIn('看台 ¥1380', result['clicks'])
+
+    def test_phone_capture_must_be_fresh_and_for_this_session(self):
+        for scenario in ['phone_missing', 'phone_stale', 'phone_wrong_date', 'phone_two_tickets']:
+            with self.subTest(scenario=scenario):
+                result = self.simulate(scenario, wechat=True, source='phone')
+                self.assertEqual(result['clicks'], [])
+                self.assertEqual(result['lockFiles'], {})
+
+    def test_capture_is_readonly_and_does_not_claim_purchase_attempt(self):
+        result = self.simulate('prepared_confirm', capture=True)
+        self.assertEqual(result['clicks'], [])
+        self.assertEqual(result['lockFiles'], {})
+        records = list(result['stored'].values())
+        self.assertEqual(len(records), 1)
+        self.assertEqual((records[0]['amount'], records[0]['quantity']), (1380, 1))
+        self.assertNotIn(RAW_PROFILE['users'][0], str(result['stored']))
+        for scenario in ['prepared_unselected', 'prepared_two_tickets', 'prepared_duplicate_tier', 'probe_detail']:
+            invalid = self.simulate(scenario, capture=True)
+            self.assertEqual(invalid['clicks'], [])
+            self.assertEqual(invalid['stored'], {})
+
+    def test_readonly_capture_is_reusable_in_a_separate_formal_engine(self):
+        captured = self.simulate('prepared_capture_other', capture=True, source='phone')
+        result = self.simulate('phone_chain', wechat=True, source='phone',
+                               initial_storage=captured['stored'])
+        self.assertEqual(result['clicks'], ['立即购票', '看台 ¥580', '确认', '提交订单'])
+        changed = self.simulate('phone_chain', wechat=True, source='phone', amount=780,
+                                initial_storage=captured['stored'])
+        self.assertEqual(changed['clicks'], [])
+
+    def test_button_ready_is_insufficient_when_tier_did_not_become_selected(self):
+        result = self.simulate('price_wrong_selection', wechat=True)
+        self.assertNotIn('确认', result['clicks'])
+        self.assertNotIn('提交订单', result['clicks'])
 
     def test_user_preselected_disabled_or_ambiguous_buttons_are_not_tapped(self):
         for scenario in ['prepared_disabled', 'prepared_ambiguous', 'prepared_two_tickets']:
@@ -745,3 +798,4 @@ class AutoXLiveExportTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

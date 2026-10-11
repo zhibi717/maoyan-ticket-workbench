@@ -7,7 +7,8 @@ const crypto = require('crypto');
 const script = fs.readFileSync(process.argv[2], 'utf8');
 const scenario = process.argv[3];
 const target = JSON.parse(script.match(/^var TARGET = (.+);$/m)[1]);
-const actualAmount = scenario.startsWith('wechat_preselected_price') ? 580 : target.amount;
+const actualAmount = scenario.startsWith('wechat_preselected_price') || scenario.startsWith('phone_') ? 580 : target.amount;
+const chosenAmount = scenario.startsWith('phone_') ? 580 : target.amount;
 let now = target.saleEpochMs + 1000;
 if (['spaced_reservation', 'slow_countdown', 'slow_countdown_challenge'].includes(scenario)) now = target.saleEpochMs - 30000;
 if (scenario === 'sale_during_sleep') now = target.saleEpochMs - 20060;
@@ -34,6 +35,19 @@ let onSaleDetailReads = 0;
 const logs = [];
 const diagnosticWrites = [];
 const stored = {};
+if (scenario.startsWith('phone_') && scenario !== 'phone_missing') {
+    stored[target.selectionKey] = {version: 1, key: target.selectionKey,
+        date: target.dateLabels[0], amount: chosenAmount, tierLabel: '看台 ¥' + chosenAmount,
+        quantity: 1, at: now - (scenario === 'phone_stale' ? 86400001 : 1000)};
+    if (scenario === 'phone_wrong_date') stored[target.selectionKey].date = '2026-12-06';
+    if (scenario === 'phone_two_tickets') stored[target.selectionKey].quantity = 2;
+}
+if (scenario.startsWith('phone_')) target.amount = chosenAmount;
+if (scenario === 'prepared_capture_other') target.amount = 580;
+if (process.argv[4]) {
+    for (const key of Object.keys(stored)) delete stored[key];
+    Object.assign(stored, JSON.parse(fs.readFileSync(process.argv[4], 'utf8')));
+}
 const lockFiles = {};
 let treeReads = 0;
 let selectorReads = 0;
@@ -68,6 +82,8 @@ function item(label, index) {
         selected: ((state === 'sku' || state === 'sku_selected') &&
             label === dateLabel && scenario !== 'sku' &&
             (scenario !== 'date_transition' || dateClicked)) ||
+            (state === 'sku_selected' && selectedSkuAt !== Infinity && scenario !== 'price_wrong_selection' &&
+                label === '看台 ¥' + target.amount) ||
             (['sku_already_target', 'retained_tier_changed', 'retained_date_changed',
               'prepared_to_sku', 'prepared_to_sku_no_change'].includes(scenario) &&
                 label === '看台 ¥' + target.amount), bounds: {
@@ -86,6 +102,7 @@ function rows() {
             now < target.saleEpochMs ? '已预约' :
                 scenario === 'prepared_entry' || scenario.startsWith('prepared_to_sku') ? '立即购票' : '确认'];
         if (scenario === 'prepared_ambiguous') labels.push('立即购票');
+        if (scenario === 'prepared_duplicate_tier') labels.push('看台 ¥' + target.amount);
         if (scenario === 'prepared_changed' && stateReads.prepared >= 3) labels[1] = '其他城市';
         if (scenario === 'prepared_action_changed' && stateReads.prepared >= 3) labels[7] = '立即支付';
         if (scenario === 'prepared_challenge' && stateReads.prepared >= 3) labels.push('人机验证');
@@ -213,6 +230,7 @@ function clickRow(row) {
              'quantity_long_delay', 'confirm_long_delay', 'order_long_delay'].includes(scenario) ? 'sku' :
             scenario === 'unknown_after_entry' ? 'unknown' : 'order';
         if (scenario === 'challenge_after_entry') state = 'challenge';
+        if (scenario.startsWith('phone_') || scenario === 'price_wrong_selection') state = 'sku';
         if (scenario.startsWith('congestion_') && scenario !== 'congestion_after_submit') congestionVisible = true;
     } else if (state === 'sku' && row.text === dateLabel && scenario === 'date_transition') {
         dateClicked = true;
@@ -371,6 +389,7 @@ const context = {
     }),
     storages: { create: () => ({
         contains: key => Object.prototype.hasOwnProperty.call(stored, key),
+        get: (key, fallback) => Object.prototype.hasOwnProperty.call(stored, key) ? stored[key] : fallback,
         put: (key, value) => { stored[key] = value; }
     }) },
     context: { getFilesDir: () => '/private' },
@@ -395,3 +414,4 @@ context.press = (x, y, duration) => {
 };
 vm.runInNewContext(script, context, { timeout: 2000 });
 process.stdout.write(JSON.stringify({ shortPresses, clicks, clickTimes, onSaleDetailReads, logs, stored, lockFiles, state, treeReads, selectorReads, diagnosticWrites, propertyReads, geometryReads, stateReads, sleeps, rectAllocations, congestionNonRefreshGeometryReads, hashComputations, regexCompilations }));
+

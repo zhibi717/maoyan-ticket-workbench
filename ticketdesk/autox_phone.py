@@ -4,7 +4,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from .autox_live_export import (REHEARSAL_OUTPUT, CONGESTION_PROBE_OUTPUT, build_wechat_script,
+from .autox_live_export import (REHEARSAL_OUTPUT, CONGESTION_PROBE_OUTPUT, CAPTURE_OUTPUT,
+                                build_selection_capture_script, build_wechat_script,
                                 build_congestion_probe_script,
                                 build_selection_rehearsal_script)
 from .paths import DATA, ROOT
@@ -50,6 +51,13 @@ def open_congestion_probe_on_phone(profile: dict, *, adb: Path = ADB,
                           output=output, phone_output='/sdcard/Download/autox-maoyan-congestion-probe.js', run=run)
 
 
+def open_selection_capture_on_phone(profile: dict, *, adb: Path = ADB,
+                                    output: Path = CAPTURE_OUTPUT, run=_run) -> None:
+    """Open a read-only capture; no entry, selection or order action."""
+    _open_script_on_phone(profile, build_selection_capture_script(profile), adb=adb,
+                          output=output, phone_output='/sdcard/Download/autox-maoyan-selection-capture.js', run=run)
+
+
 def _open_script_on_phone(profile: dict, script: str, *, adb: Path, output: Path,
                           phone_output: str, run) -> None:
     if not adb.is_file():
@@ -75,3 +83,4 @@ def _open_script_on_phone(profile: dict, script: str, *, adb: Path, output: Path
     run(base + ['shell', 'am', 'start', '-a', 'android.intent.action.VIEW',
                 '-d', 'file://' + phone_output, '-t', 'application/x-javascript',
                 '-n', AUTOX_ACTIVITY])
+

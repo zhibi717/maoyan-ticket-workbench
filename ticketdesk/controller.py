@@ -93,6 +93,18 @@ class Controller:
             self.state['status'] = '已在手机打开 AutoX 脚本；点“运行脚本”并切回目标页。核对票档、1 张和指定观演人后，仅提交明确的订单按钮一次，尝试进入微信付款页后停止，不付款。'
             self.log('AutoX 脚本已打开；核对订单及观演人后提交一次，尝试到微信付款页后停止；确认购票页支持立即支付；收银台需确认微信方式，进入微信后停止。')
 
+    def open_autox_selection_capture(self):
+        with self.lock:
+            if self.state['busy']:
+                raise ValueError('请先停止正在运行的任务。')
+            profile = self.selected_profile()
+            if profile['platform'] != 'maoyan':
+                raise ValueError('记录手机预选目前只支持猫眼。')
+            from .autox_phone import open_selection_capture_on_phone
+            open_selection_capture_on_phone(profile)
+            self.state['status'] = '已打开记录预选文件；运行后 20 秒内切到猫眼预约选档页。仅记录明确选中的场次、票档和 1 张，不点击。'
+            self.log('只读预选记录脚本已打开；改选后须重新记录。')
+
     def open_autox_rehearsal(self):
         with self.lock:
             if self.state['busy']:
@@ -227,3 +239,4 @@ class Controller:
                     self.state['stage'] == 'verification'):
                 raise ValueError('当前不在模拟验证阶段；真机验证请在手机完成。')
             self.verified.set()
+

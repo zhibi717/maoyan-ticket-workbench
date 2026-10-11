@@ -10,6 +10,7 @@ var SUBMIT_TO_PAYMENT = false;
 var CONGESTION_PRECHECK_ONLY = false;
 var OPEN_WECHAT_PAYMENT = false;
 var USER_PRESELECTED = false;
+var CAPTURE_SELECTION_ONLY = false;
 
 (function () {
     if (!ENABLE_EXPERIMENTAL_LIVE) {
@@ -44,6 +45,7 @@ var USER_PRESELECTED = false;
     var screenReadMs = 0;
     var screenReadMaxMs = 0;
     var readOrderFields = false;
+    var readSelectionFields = false;
     var patterns = {};
     var lastScreenReadMs = 0;
     var labelReads = 0;
@@ -157,15 +159,16 @@ var USER_PRESELECTED = false;
                     // Selection needs enabled/selected flags. Checkbox details
                     // are only needed when inspecting the order review.
                     var orderFields = !labelsOnly && readOrderFields;
+                    var selectionFields = !labelsOnly && readSelectionFields;
                     var classValue = orderFields ? String(raw.getClassName() || "") : "";
-                    var isCheckable = orderFields && raw.isCheckable();
+                    var isCheckable = (orderFields || selectionFields) && raw.isCheckable();
                     var row = {
                         label: label,
                         description: description,
                         classValue: classValue,
                         packageValue: String(raw.getPackageName() || ""),
                         isEnabled: needsGeometry && raw.isEnabled(),
-                        isChecked: orderFields &&
+                        isChecked: (orderFields || selectionFields) &&
                             (isCheckable || classValue === "android.widget.CheckBox") && raw.isChecked(),
                         isCheckable: isCheckable,
                         isSelected: !labelsOnly && raw.isSelected(),
@@ -385,9 +388,71 @@ var USER_PRESELECTED = false;
             var numbers = label.match(/\d+(?:\.\d{1,2})?/g) || [];
             if (label.length <= 35 && numbers.length === 1 &&
                     Number(numbers[0]) === TARGET.amount &&
+                    tierKindMatches(label) &&
                     !/(缺货|售罄|不可售|登记)/.test(label) && candidateAvailable(nodes[i])) result.push(nodes[i]);
         }
         return result;
+    }
+    function tierKindMatches(label) {
+        // Amount alone cannot distinguish two different categories at the same price.
+        var expected = String(TARGET.tierLabel || "").match(/(?:看台|内场|大屏|站票|坐票|VIP)/g) || [];
+        var actual = label.match(/(?:看台|内场|大屏|站票|坐票|VIP)/g) || [];
+        if (!actual.length) return true; // split text nodes remain subject to uniqueness checks
+        for (var i = 0; i < expected.length; i++) if (actual.indexOf(expected[i]) < 0) return false;
+        return true;
+    }
+    function recordSelectedTarget() {
+        checkBlockers();
+        verifyDetail(false, true);
+        if (!preparedLayout()) stop("请先打开猫眼预约选档页，再记录手机预选。");
+        var date = unique(dateNodes(), "预选场次");
+        if (!nodeAlreadySelected(date)) stop("无法读取目标场次的选中状态；请改用工作台填写目标。");
+        var candidates = matching(function (node) {
+            var label = node.label.replace(/[,，]/g, "");
+            var numbers = label.match(/\d+(?:\.\d{1,2})?/g) || [];
+            return label.length <= 60 && /[¥￥元]|看台|内场|VIP/.test(label) &&
+                numbers.length === 1 && Number(numbers[0]) > 0 && Number(numbers[0]) <= 100000 &&
+                nodeAlreadySelected(node);
+        });
+        var tier = unique(candidates, "明确选中的票档");
+        if (/(缺货|售罄|不可售|登记)/.test(tier.label)) stop("预选票档当前不可售，未记录。");
+        var counts = matchingPattern(/\d+\s*(?:张|份)/, false);
+        if (!counts.length) stop("无法确认预选数量为 1 张；请改用工作台填写目标。");
+        for (var i = 0; i < counts.length; i++) {
+            if (Number(counts[i].label.match(/(\d+)\s*(?:张|份)/)[1]) !== 1) {
+                stop("预选数量不是 1 张，未记录。");
+            }
+        }
+        var selectedDates = matching(function (node) {
+            return /20\d{2}[-./年]\d{1,2}[-./月]\d{1,2}/.test(node.label) &&
+                node.label.length <= 30 && nodeAlreadySelected(node);
+        });
+        if (selectedDates.length > 1) stop("预选场次不唯一，未记录。");
+        var record = { version: 1, key: TARGET.selectionKey, date: TARGET.dateLabels[0],
+            amount: Number(tier.label.replace(/[,，]/g, "").match(/\d+(?:\.\d{1,2})?/)[0]),
+            tierLabel: tier.label, quantity: 1, at: Date.now() };
+        storages.create("qiangpiao.autox.maoyan.selection.v1").put(TARGET.selectionKey, record);
+        mark("已记录明确预选");
+        report("手机预选已记录；改选场次或票档后须重新记录。未点击、未下单。");
+    }
+    function loadFrozenTarget() {
+        if (TARGET.selectionSource !== "phone") return;
+        var record = storages.create("qiangpiao.autox.maoyan.selection.v1").get(TARGET.selectionKey, null);
+        if (!record || record.version !== 1 || record.key !== TARGET.selectionKey ||
+                record.date !== TARGET.dateLabels[0] || record.quantity !== 1 ||
+                typeof record.amount !== "number" || record.amount <= 0 || record.amount > 100000 ||
+                typeof record.tierLabel !== "string" || record.tierLabel.length > 60 ||
+                (record.tierLabel.replace(/[,，]/g, "").match(/\d+(?:\.\d{1,2})?/g) || []).length !== 1 ||
+                Number((record.tierLabel.replace(/[,，]/g, "").match(/\d+(?:\.\d{1,2})?/) || [0])[0]) !== record.amount ||
+                typeof record.at !== "number" || Date.now() < record.at || Date.now() - record.at > 86400000) {
+            stop("手机预选未记录或已过期；请重新记录，或改用工作台填写目标。未点击购票。");
+        }
+        TARGET.amount = record.amount;
+        TARGET.tierLabel = record.tierLabel;
+        readSelectionFields = true;
+        rawAmount = String(TARGET.amount);
+        amountTokens = [rawAmount, rawAmount.replace(/\B(?=(\d{3})+(?!\d))/g, ",")];
+        mark("已锁定记录的票档");
     }
     function candidateAvailable(node) {
         if (!node.enabled()) return false;
@@ -444,10 +509,7 @@ var USER_PRESELECTED = false;
             var currency = label.match(/[¥￥]\s*(\d+(?:\.\d{1,2})?)/);
             if (currency && Number(currency[1]) === TARGET.amount) amountMatched = true;
         }
-        if (USER_PRESELECTED) {
-            var actual = visibleOrderAmount();
-            if (actual === null || submittedAmount !== null && actual !== submittedAmount) return false;
-        } else if (!amountMatched) return false;
+        if (!amountMatched || visibleOrderAmount() !== TARGET.amount) return false;
         var quantities = matchingPattern(/\d+\s*张/, false);
         var one = false;
         for (var j = 0; j < quantities.length; j++) {
@@ -671,7 +733,7 @@ var USER_PRESELECTED = false;
         var b = target.bounds();
         // Some Maoyan builds expose the red selected card through Android's
         // selected flag. If they do not, the safe fallback is to tap the date.
-        var marked = matching(function (node) { return node.isSelected; });
+        var marked = matching(function (node) { return node.isSelected || node.isCheckable && node.isChecked; });
         for (var i = 0; i < marked.length; i++) {
             var card = marked[i].bounds();
             if (card.left <= b.left && card.top <= b.top &&
@@ -703,9 +765,24 @@ var USER_PRESELECTED = false;
                 retainedTierSelection && !nodeAlreadySelected(tier)) {
             stop("确认前预选场次或票档状态已变化，已停止。");
         }
+        if (!skuSelectionMatches(tier)) stop("无法确认目标票档已选中或合计金额，已停止。");
         unique(exactNodes(["1张", "1 张", "1份", "1 份"]), "1 张数量");
         var button = unique(confirmationNodes(), "票档确认按钮");
         safeButtonBounds(button, "票档确认");
+    }
+    function skuSelectionMatches(tier) {
+        if (nodeAlreadySelected(tier)) return true;
+        var totals = matching(function (node) {
+            return /总计|合计|应付/.test(node.label) ||
+                /^[¥￥]\s*[\d,.]+(?:\s*元)?$/.test(node.label) && node.area &&
+                node.area.top > device.height * 0.75;
+        });
+        var amounts = [];
+        for (var i = 0; i < totals.length; i++) {
+            var value = totals[i].label.replace(/[,，]/g, "").match(/[¥￥]\s*(\d+(?:\.\d{1,2})?)/);
+            if (value && amounts.indexOf(Number(value[1])) < 0) amounts.push(Number(value[1]));
+        }
+        return amounts.length === 1 && amounts[0] === TARGET.amount;
     }
     function waitForSkuConfirmation(timeoutMs) {
         var deadline = Date.now() + timeoutMs;
@@ -714,13 +791,18 @@ var USER_PRESELECTED = false;
             if (kind === "order") return kind;
             if (kind === "sku") {
                 unique(priceNodes(), "目标票档");
+                if (retainedDateSelection && !targetDateAlreadySelected() ||
+                        retainedTierSelection && !nodeAlreadySelected(unique(priceNodes(), "目标票档"))) {
+                    stop("确认前预选场次或票档状态已变化，已停止。");
+                }
                 var quantities = exactNodes(["1张", "1 张", "1份", "1 份"]);
                 var quantityLabels = matchingPattern(/\d+\s*(?:张|份)/, false);
                 for (var i = 0; i < quantityLabels.length; i++) {
                     var count = quantityLabels[i].label.match(/(\d+)\s*(?:张|份)/);
                     if (count && Number(count[1]) !== 1) stop("票档数量不是 1 张，已停止。");
                 }
-                if (!has("请选择票档") && quantities.length === 1 && confirmationNodes().length === 1) {
+                if (!has("请选择票档") && quantities.length === 1 && confirmationNodes().length === 1 &&
+                        skuSelectionMatches(unique(priceNodes(), "目标票档"))) {
                     return kind;
                 }
             }
@@ -739,10 +821,6 @@ var USER_PRESELECTED = false;
         stop("页面转换后未识别出选票或订单页，已停止。");
     }
     function continueSkuFlow() {
-        if (USER_PRESELECTED) {
-            continueUserSelectedSku();
-            return;
-        }
         if (!targetDateAlreadySelected()) {
             clickFresh("目标日期", dateNodes, function () {
                 if (pageKind() !== "sku") stop("目标日期选择页已变化，已停止。");
@@ -761,13 +839,15 @@ var USER_PRESELECTED = false;
             return;
         }
         else {
-            if (!has("请选择票档")) {
-                if (!nodeAlreadySelected(unique(priceNodes(), "已选目标票档"))) {
-                    stop("票档页已有选择，但未确认是目标金额，请在手机核对。");
-                }
+            if (nodeAlreadySelected(unique(priceNodes(), "目标票档"))) {
                 retainedTierSelection = true;
                 mark("沿用已选票档");
             } else {
+                if (!has("请选择票档") && !matching(function (node) {
+                    return /[¥￥元]|看台|内场|VIP/.test(node.label) &&
+                        (node.label.match(/\d+(?:\.\d{1,2})?/g) || []).length === 1 &&
+                        nodeAlreadySelected(node);
+                }).length) stop("票档页已有选择，但无法确认已选金额，请在手机核对。");
                 clickFresh("目标票档", priceNodes, function () {
                     if (pageKind() !== "sku") stop("目标票档选择页已变化，已停止。");
                 });
@@ -828,12 +908,12 @@ var USER_PRESELECTED = false;
         return preparedLayout() && has(TARGET.titleToken) && has(TARGET.city);
     }
     function verifyPrepared(reuseDecision) {
-        if (!reuseDecision) checkPackage(USER_PRESELECTED ? "prepared" : false);
+        if (!reuseDecision) checkPackage(false);
         verifyDetail(false, true);
         if (!preparedLayout() || has("请选择票档")) {
             stop("预选页面状态已变化，已停止。");
         }
-        if (!USER_PRESELECTED) {
+        {
             var date = unique(dateNodes(), "预选场次");
             var tier = unique(priceNodes(), "预选票档");
             if (!nodeAlreadySelected(date) || !nodeAlreadySelected(tier)) {
@@ -910,30 +990,6 @@ var USER_PRESELECTED = false;
         }
         stop("预选页已点击一次但订单页未确认，已停止；不会重复点击。");
     }
-    function continueUserSelectedSku() {
-        var readyDeadline = Date.now() + 2000;
-        while (Date.now() < readyDeadline) {
-            checkPackage("prepared");
-            var kind = pageKind(true);
-            if (kind === "order") { finishAtOrder(); return; }
-            if (kind === "sku" && !has("请选择票档") &&
-                    exactNodes(["1张", "1 张", "1份", "1 份"]).length === 1 &&
-                    confirmationNodes().length === 1) {
-                clickFresh("票档确认", confirmationNodes, function () {
-                    checkBlockers();
-                    unique(exactNodes(["1张", "1 张", "1份", "1 份"]), "用户预选票数");
-                });
-                var orderDeadline = Date.now() + 8000;
-                while (Date.now() < orderDeadline) {
-                    if (pageKind() === "order") { finishAtOrder(); return; }
-                    pauseAfterRead(20);
-                }
-                stop("已确认用户预选，但订单页未确认，已停止；不重复点击。");
-            }
-            pauseAfterRead(20);
-        }
-        stop("用户预选尚未使确认按钮就绪，已停止；不会切换场次或票档。");
-    }
     function claimAttempt() {
         // Java File.createNewFile is atomic across two script engines. A
         // crashed script leaves the marker in AutoX private storage, which
@@ -959,6 +1015,12 @@ var USER_PRESELECTED = false;
             timeOrigin = Date.now();
             readOrderFields = true;
             checkPackage();
+            if (CAPTURE_SELECTION_ONLY) {
+                recordSelectedTarget();
+                return;
+            }
+            loadFrozenTarget();
+            if (TARGET.selectionSource === "phone") checkPackage();
             if (nameDigest("qiangpiao") !== "571ca4acfff4ab88e8e95a21b5ef78cc614c1ca65de69db58a108fdd4bb671f2") {
                 stop("手机端姓名摘要校验异常，已停止只读检查。");
             }
@@ -1026,6 +1088,7 @@ var USER_PRESELECTED = false;
         if (!SELECTION_REHEARSAL && storage.contains(TARGET.attemptKey)) {
             stop("这场演出已有一次手机端选档尝试；请核对猫眼页面。");
         }
+        loadFrozenTarget();
         if (preparedLayout()) {
             runPreparedStart();
             return;
@@ -1110,3 +1173,4 @@ var USER_PRESELECTED = false;
             "手机端原型遇到未知页面或权限异常，已停止；请在猫眼核对。");
     }
 })();
+
