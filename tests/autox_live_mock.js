@@ -7,11 +7,15 @@ const crypto = require('crypto');
 const script = fs.readFileSync(process.argv[2], 'utf8');
 const scenario = process.argv[3];
 const target = JSON.parse(script.match(/^var TARGET = (.+);$/m)[1]);
+const maskedScenario = scenario.startsWith('wechat_masked_');
+const paymentSheetScenario = scenario.startsWith('wechat_payment_sheet') ||
+    scenario === 'wechat_masked_selected_sheet' || scenario === 'payment_order_sheet';
+const fullFastFlowScenario = scenario.startsWith('wechat_payment_sheet_full_flow');
 const actualAmount = scenario.startsWith('wechat_preselected_price') || scenario.startsWith('phone_') ? 580 : target.amount;
 const chosenAmount = scenario.startsWith('phone_') ? 580 : target.amount;
 let now = target.saleEpochMs + 1000;
 if (['spaced_reservation', 'slow_countdown', 'slow_countdown_challenge'].includes(scenario)) now = target.saleEpochMs - 30000;
-if (scenario === 'sale_during_sleep') now = target.saleEpochMs - 20060;
+if (scenario === 'sale_during_sleep' || scenario === 'sale_during_sleep_challenge') now = target.saleEpochMs - 20060;
 let state = 'detail';
 if (scenario.startsWith('prepared_')) state = 'prepared';
 if (scenario === 'prepared_countdown') now = target.saleEpochMs - 20060;
@@ -53,6 +57,7 @@ const lockFiles = {};
 let treeReads = 0;
 let selectorReads = 0;
 const stateReads = {};
+const detailReadStartedAfterSaleMs = [];
 const propertyReads = { className: 0, checkable: 0, checked: 0 };
 const geometryReads = {};
 const sleeps = [];
@@ -69,7 +74,7 @@ function item(label, index) {
         className: label === '[观演人勾选框]' ?
             scenario === 'custom_checkable' ? 'android.view.View' : 'android.widget.CheckBox' : 'android.widget.TextView',
         checkable: label === '[观演人勾选框]' || state === 'cashier' && label === '微信支付',
-        checked: !['attendee_unchecked', 'attendee_no_change', 'slow_attendee_no_change', 'attendee_delayed', 'attendee_long_delay', 'attendee_disabled', 'custom_checkable'].includes(scenario) && label === '[观演人勾选框]',
+        checked: !['attendee_unchecked', 'attendee_no_change', 'slow_attendee_no_change', 'attendee_delayed', 'attendee_long_delay', 'attendee_disabled', 'custom_checkable', 'wechat_masked_unchecked', 'wechat_cashier_unselected_after_attendee'].includes(scenario) && label === '[观演人勾选框]',
         enabled: !(scenario === 'disabled_confirm' && state === 'sku_selected' && confirmation) &&
             !(scenario === 'disabled_submit' && label === '提交订单') &&
             !(scenario === 'congestion_disabled' && label === '刷新') &&
@@ -125,6 +130,7 @@ function rows() {
         }
         if (scenario === 'spaced_reservation') labels[2] = '已   预\n约';
         if (scenario === 'slow_countdown_challenge' && onSaleDetailReads >= 2) labels.push('人机验证');
+        if (scenario === 'sale_during_sleep_challenge' && now >= target.saleEpochMs) labels.push('人机验证');
         if (scenario === 'ambiguous_entry') labels.push('立即购票');
         if (scenario === 'long_detail_notice') labels.unshift('普通说明'.repeat(5000));
         if (scenario === 'long_detail_challenge') labels.unshift('普通说明'.repeat(5000) + '人机验证');
@@ -151,22 +157,31 @@ function rows() {
         if (scenario === 'ambiguous_confirm') labels.push('确认');
         return labels.map(item);
     }
-    if (state === 'order') {
+    if (state === 'order' || state === 'payment_sheet') {
         const price = scenario === 'combined_order_summary' ? '看台 ￥' + target.amount + ' ×1张' :
             scenario === 'decimal_price_payment_label' ?
             '¥' + target.amount + '.00' : '¥' +
             (scenario === 'wrong_order_price' ? target.amount + 100 :
-                scenario === 'substring_order_price' ? 11380 : actualAmount);
+                scenario === 'substring_order_price' ? 11380 :
+                    state === 'payment_sheet' && scenario === 'wechat_payment_sheet_right_amount_background_wrong' ? actualAmount + 100 : actualAmount);
+        const attendeeName = maskedScenario ?
+            scenario === 'wechat_masked_wrong' || scenario === 'wechat_masked_changed_before_submit' && stateReads.order >= 3 ? '另***人' :
+                scenario === 'wechat_masked_all_stars' ? '*****' :
+                    scenario === 'wechat_masked_fullwidth' ? '测＊＊＊人' : '测***人' :
+            scenario === 'wrong_attendee' ? '另一个人' : '测试观演人';
         const labels = [target.titleToken, target.city,
             scenario === 'wrong_order_date' ? '2026-12-06 周日 19:00' : dateLabel,
-            price, '实名观演人', scenario === 'wrong_attendee' ? '另一个人' : '测试观演人'];
-        if (['instant_pay_order', 'combined_order_summary', 'wechat_immediate_review'].includes(scenario)) labels.unshift('\u786e\u8ba4\u8d2d\u7968');
+            price, '实名观演人', attendeeName];
+        const immediateReview = ['instant_pay_order', 'combined_order_summary', 'wechat_immediate_review'].includes(scenario) ||
+            maskedScenario || paymentSheetScenario && scenario !== 'payment_order_sheet';
+        if (immediateReview) labels.unshift('\u786e\u8ba4\u8d2d\u7968');
+        if (scenario === 'wechat_masked_ambiguous') labels.push('测***人');
         if (scenario !== 'attendee_missing') labels.push('[观演人勾选框]');
-        if (scenario === 'attendee_ambiguous') labels.push('[观演人勾选框]');
+        if (scenario === 'attendee_ambiguous' || scenario === 'wechat_masked_ambiguous_checkbox') labels.push('[观演人勾选框]');
         if (scenario !== 'combined_order_summary') labels.push(scenario === 'two_ticket_order' ? '2张' :
             scenario === 'eleven_ticket_order' ? '11张' : '1张');
         labels.push('取票方式',
-            ['instant_pay_order', 'combined_order_summary', 'wechat_immediate_review'].includes(scenario) ? '立即支付' : '提交订单');
+            immediateReview ? '立即支付' : '提交订单');
         if (scenario === 'decimal_price_payment_label') labels.push('支付方式');
         if (scenario === 'ambiguous_submit') labels.push('提交订单');
         if (scenario === 'autopay_order') labels.push('免密支付');
@@ -180,7 +195,56 @@ function rows() {
                 labels[1] = '其他城市';
             }
         }
-        return labels.map(item);
+        const records = labels.map(item);
+        if (scenario === 'wechat_masked_ambiguous') {
+            // Both name labels belong to the same attendee region.
+            const names = records.filter(row => row.text === '测***人');
+            names[1].bounds = {...names[0].bounds, top: names[0].bounds.top + 5, bottom: names[0].bounds.bottom + 5};
+        }
+        if (scenario === 'wechat_masked_check_changed_before_submit' && stateReads.order >= 3) {
+            records.forEach(row => { if (row.text === '[观演人勾选框]') row.checked = false; });
+        }
+        if (state === 'payment_sheet' || scenario === 'wechat_payment_sheet_before_submit' && stateReads.order >= 3) {
+            const amount = scenario === 'wechat_payment_sheet_wrong_amount_background_right' ||
+                scenario === 'wechat_payment_sheet_amount_changed_before_review' && stateReads.payment_sheet >= 2 ? 1580 : actualAmount;
+            const sheetLabels = ['支付订单', '支付剩余时间 14:59', '¥' + amount + '.00', '支付方式', '微信支付', '云闪付', '确认支付'];
+            if (scenario === 'wechat_payment_sheet_missing_method') sheetLabels.splice(3, 1);
+            if (scenario === 'wechat_payment_sheet_ambiguous_amount') sheetLabels.splice(3, 0, '¥' + (amount + 100) + '.00');
+            if (scenario === 'wechat_payment_sheet_ambiguous_button') sheetLabels.push('确认支付');
+            if (scenario === 'wechat_payment_sheet_ambiguous_method') sheetLabels.push('微信支付');
+            if (scenario === 'wechat_payment_sheet_autopay') sheetLabels.push('免密支付');
+            if (scenario === 'wechat_payment_sheet_split_amount') sheetLabels.splice(2, 1, '¥', amount + '.00');
+            const sheetRows = sheetLabels.map((label, index) => {
+                const row = item(label, index);
+                row.paymentSheet = true;
+                row.bounds = {left: 80, top: 1090 + index * 120, right: 1000, bottom: 1160 + index * 120};
+                if (label === '确认支付') row.bounds = {
+                    left: 80, top: scenario === 'wechat_payment_sheet_bad_button_bounds' ? 1500 : 2190,
+                    right: 1000, bottom: scenario === 'wechat_payment_sheet_bad_button_bounds' ? 1580 : 2310
+                };
+                if (label === '微信支付') {
+                    row.checkable = true;
+                    row.checked = scenario !== 'wechat_payment_sheet_wechat_unselected' &&
+                        !(scenario === 'wechat_payment_sheet_method_changed' && stateReads.payment_sheet >= 2);
+                    if (scenario === 'wechat_payment_sheet_sibling_selected') {
+                        row.checkable = false;
+                        row.checked = false;
+                        row.wechatMethodRow = true;
+                    }
+                }
+                if (label === '云闪付') { row.checkable = true; row.checked = scenario === 'wechat_payment_sheet_multiple_selected'; }
+                if (scenario === 'wechat_payment_sheet_disabled_button' && label === '确认支付') row.enabled = false;
+                return row;
+            });
+            if (scenario === 'wechat_payment_sheet_sibling_selected') {
+                const method = sheetRows.find(row => row.text === '微信支付');
+                sheetRows.push({text: '[微信选择框]', className: 'android.widget.RadioButton', enabled: true,
+                    checkable: true, checked: true, paymentSheet: true, wechatMethodRow: true,
+                    bounds: {left: 920, top: method.bounds.top + 10, right: 980, bottom: method.bounds.bottom - 10}});
+            }
+            records.push(...sheetRows);
+        }
+        return records;
     }
     if (state === 'payment') return (scenario === 'pending_after_submit' ?
         ['待付款', '去支付'] : ['收银台', '支付方式', '微信支付', '确认付款']).map(item);
@@ -190,7 +254,7 @@ function rows() {
                 scenario === 'wechat_cashier_explicit' ? '前往微信支付' : '立即支付'];
         if (scenario === 'wechat_cashier_autopay') labels.push('免密支付');
         return labels.map(item).map(row => {
-            if (row.text === '微信支付') row.checked = scenario !== 'wechat_cashier_unselected' &&
+            if (row.text === '微信支付') row.checked = !['wechat_cashier_unselected', 'wechat_cashier_unselected_after_attendee'].includes(scenario) &&
                 !(scenario === 'wechat_cashier_method_changed' && stateReads.cashier >= 2);
             return row;
         });
@@ -203,12 +267,18 @@ function rows() {
 function clickRow(row) {
     clicks.push(row.text);
     clickTimes.push(now - target.saleEpochMs);
+    if (state === 'payment_sheet' && row.text === '确认支付') {
+        if (scenario === 'wechat_payment_sheet_launch_failed') return false;
+        if (scenario !== 'wechat_payment_sheet_launch_timeout') state = 'wechat';
+        return true;
+    }
     if (state === 'cashier' && ['立即支付', '前往微信支付'].includes(row.text)) {
         if (scenario !== 'wechat_cashier_timeout') state = 'wechat';
         return true;
     }
     if (row.text === '刷新' && congestionVisible) {
         refreshCount++;
+        if (scenario === 'wechat_payment_sheet_during_congestion') { state = 'payment_sheet'; return true; }
         if (scenario === 'congestion_challenge') { state = 'challenge'; congestionVisible = false; }
         else if (scenario === 'congestion_payment') { state = 'payment'; congestionVisible = false; }
         else if (!['congestion_forever', 'congestion_disabled', 'congestion_ambiguous', 'congestion_wrong_order'].includes(scenario) && refreshCount >= 3) {
@@ -231,7 +301,7 @@ function clickRow(row) {
              'quantity_long_delay', 'confirm_long_delay', 'order_long_delay'].includes(scenario) ? 'sku' :
             scenario === 'unknown_after_entry' ? 'unknown' : 'order';
         if (scenario === 'challenge_after_entry') state = 'challenge';
-        if (scenario.startsWith('phone_') || scenario === 'price_wrong_selection') state = 'sku';
+        if (scenario.startsWith('phone_') || scenario === 'price_wrong_selection' || fullFastFlowScenario) state = 'sku';
         if (scenario.startsWith('congestion_') && scenario !== 'congestion_after_submit') congestionVisible = true;
     } else if (state === 'sku' && row.text === dateLabel && scenario === 'date_transition') {
         dateClicked = true;
@@ -248,7 +318,8 @@ function clickRow(row) {
             (scenario === 'attendee_long_delay' ? 1200 : 120);
         else if (!['attendee_no_change', 'slow_attendee_no_change'].includes(scenario)) attendeeChecked = true;
     } else if (state === 'order' && (row.text === '提交订单' || row.text === '立即支付')) {
-        if (scenario === 'wechat_congestion_after_submit') congestionVisible = true;
+        if (scenario === 'wechat_congestion_after_submit' || scenario === 'wechat_payment_sheet_during_congestion') congestionVisible = true;
+        else if (paymentSheetScenario) state = 'payment_sheet';
         else if (scenario.startsWith('wechat_cashier_') || scenario === 'wechat_preselected_price_changed') state = 'cashier';
         else if (scenario.startsWith('wechat_')) state = 'wechat';
         else if (scenario === 'congestion_after_submit') congestionVisible = true;
@@ -267,7 +338,7 @@ function node(row) {
             bounds: () => ({ left: 10, top: 500, right: 700, bottom: 770 }),
             parent: () => null
         } : null,
-        checked: () => attendeeChecked || now >= attendeeCheckedAt || row.checked,
+        checked: () => row.text === '[观演人勾选框]' && (attendeeChecked || now >= attendeeCheckedAt) || row.checked,
         click: () => clickRow(row)
     };
 }
@@ -309,7 +380,8 @@ function nativeRow(row, children) {
             Object.assign(rect, row.bounds);
         },
         isEnabled: () => row.enabled !== false,
-        isChecked: () => { propertyReads.checked++; return row.checkable && (attendeeChecked || now >= attendeeCheckedAt || row.checked); },
+        isChecked: () => { propertyReads.checked++; return row.checkable &&
+            (row.text === '[观演人勾选框]' && (attendeeChecked || now >= attendeeCheckedAt) || row.checked); },
         isCheckable: () => { propertyReads.checkable++; return !!row.checkable; },
         isSelected: () => !!row.selected,
         getChildCount: () => children.length,
@@ -319,6 +391,7 @@ function nativeRow(row, children) {
 }
 function nativeRoot() {
     treeReads++;
+    if (state === 'detail') detailReadStartedAfterSaleMs.push(now - target.saleEpochMs);
     if (['slow_entry', 'slow_countdown', 'slow_countdown_challenge'].includes(scenario)) now += 120;
     if (state === 'detail' && now >= target.saleEpochMs) onSaleDetailReads++;
     if (scenario === 'slow_attendee_no_change' && state === 'order') now += 120;
@@ -347,7 +420,14 @@ function nativeRoot() {
     }
     const children = [];
     const dialogChildren = [];
+    const paymentSheetChildren = [];
+    const wechatMethodChildren = [];
     for (const row of records) {
+        if (row.paymentSheet && scenario !== 'wechat_payment_sheet_unbounded') {
+            if (row.wechatMethodRow) wechatMethodChildren.push(nativeRow(row));
+            else paymentSheetChildren.push(nativeRow(row));
+            continue;
+        }
         if (congestionVisible && /前方拥堵|请刷新重试/.test(row.text)) {
             row.bounds = {left: 200, top: 720, right: 850, bottom: 790};
             if (scenario === 'congestion_description_hints') {
@@ -368,6 +448,16 @@ function nativeRoot() {
                 bounds: {left: 10, top: 500, right: 700, bottom: 770}},
                 [nativeRow(row), nativeRow(records.find(record => record.text === '缺货登记'))]));
         } else children.push(nativeRow(row));
+    }
+    if (wechatMethodChildren.length) {
+        const method = records.find(row => row.text === '微信支付' && row.paymentSheet);
+        paymentSheetChildren.push(nativeRow({text: '', enabled: true,
+            bounds: {left: 60, top: method.bounds.top - 10, right: 1020, bottom: method.bounds.bottom + 10}},
+            wechatMethodChildren));
+    }
+    if (paymentSheetChildren.length) {
+        children.push(nativeRow({text: '', enabled: true,
+            bounds: {left: 0, top: 1000, right: 1080, bottom: 2400}}, paymentSheetChildren));
     }
     if (dialogChildren.length) {
         if (scenario === 'congestion_unbounded_dialog') {
@@ -441,8 +531,12 @@ const shortPresses = [];
 context.press = (x, y, duration) => {
     shortPresses.push({duration, state});
     if (scenario === 'entry_press_failed') return false;
+    if (scenario === 'wechat_payment_sheet_full_flow_failed_confirm' && state === 'sku_selected') return false;
+    if (scenario === 'wechat_payment_sheet_full_flow_failed_submit' && state === 'order') return false;
+    if (scenario === 'wechat_payment_sheet_full_flow_failed_gateway' && state === 'payment_sheet') return false;
     return context.click(x, y);
 };
+if (scenario === 'wechat_payment_sheet_full_flow_no_press') delete context.press;
 vm.runInNewContext(script, context, { timeout: 2000 });
-process.stdout.write(JSON.stringify({ shortPresses, clicks, clickTimes, onSaleDetailReads, logs, stored, lockFiles, state, treeReads, selectorReads, diagnosticWrites, propertyReads, geometryReads, stateReads, sleeps, rectAllocations, congestionNonRefreshGeometryReads, congestionUnderlyingGeometryReads, hashComputations, regexCompilations }));
+process.stdout.write(JSON.stringify({ shortPresses, clicks, clickTimes, onSaleDetailReads, logs, stored, lockFiles, state, treeReads, selectorReads, diagnosticWrites, propertyReads, geometryReads, stateReads, detailReadStartedAfterSaleMs, sleeps, rectAllocations, congestionNonRefreshGeometryReads, congestionUnderlyingGeometryReads, hashComputations, regexCompilations }));
 

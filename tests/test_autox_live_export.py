@@ -1,4 +1,5 @@
 """The phone-side flow stays locked, private, and parseable until field validation."""
+import hashlib
 import json
 import shutil
 import subprocess
@@ -65,12 +66,58 @@ class AutoXLiveExportTests(unittest.TestCase):
 
     def test_entry_short_press_stops_before_wechat_and_never_retries_failure(self):
         outcome = self.simulate('wechat_direct', wechat=True)
-        self.assertEqual(outcome['shortPresses'], [{'duration': 1, 'state': 'detail'}])
+        self.assertEqual(outcome['shortPresses'][0], {'duration': 1, 'state': 'detail'})
+        self.assertTrue(all(item['duration'] == 1 and item['state'] != 'wechat'
+                            for item in outcome['shortPresses']))
         self.assertEqual(outcome['state'], 'wechat')
         failed = self.simulate('entry_press_failed', wechat=True)
         self.assertEqual(len(failed['shortPresses']), 1)
         self.assertEqual(failed['clicks'], [])
         self.assertEqual(failed['state'], 'detail')
+
+    def test_short_touches_continue_all_four_merchant_pages_without_touching_wechat(self):
+        outcome = self.simulate('wechat_payment_sheet_full_flow', wechat=True, amount=480)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥480', '确认', '立即支付', '确认支付'])
+        self.assertEqual(outcome['state'], 'wechat')
+        self.assertEqual(len(outcome['shortPresses']), len(outcome['clicks']))
+        self.assertTrue(all(item['duration'] == 1 and item['state'] != 'wechat'
+                            for item in outcome['shortPresses']))
+        record = outcome['diagnosticWrites'][-1]['data']
+        self.assertEqual(record['state'], 'wechat_payment_page')
+        self.assertEqual(len(record['touchTimings']), len(outcome['clicks']))
+        self.assertTrue(all(item['pressDurationMs'] == 1 for item in record['touchTimings']))
+        self.assertFalse(record['automaticPayment'])
+        unselected_date = self.simulate('sku', payment=True, amount=480)
+        self.assertEqual(unselected_date['clicks'], ['立即购票', '2026-12-05 周六 19:00',
+                                                   '看台 ¥480', '确认', '提交订单'])
+        self.assertTrue(all(item['duration'] == 1 for item in unselected_date['shortPresses']))
+
+    def test_failed_short_confirmation_does_not_fall_back_or_submit(self):
+        outcome = self.simulate('wechat_payment_sheet_full_flow_failed_confirm', wechat=True)
+        self.assertEqual(outcome['state'], 'sku_selected')
+        self.assertNotIn('确认', outcome['clicks'])
+        self.assertNotIn('立即支付', outcome['clicks'])
+        self.assertEqual(sum(item['state'] == 'sku_selected' for item in outcome['shortPresses']), 1)
+
+    def test_failed_short_submission_or_gateway_never_retries(self):
+        for scenario, state, attempted, forbidden in [
+                ('wechat_payment_sheet_full_flow_failed_submit', 'order', 'submission_attempted', '立即支付'),
+                ('wechat_payment_sheet_full_flow_failed_gateway', 'payment_sheet', 'wechat_launch_attempted', '确认支付')]:
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, wechat=True)
+                self.assertEqual(outcome['state'], state)
+                self.assertNotIn(forbidden, outcome['clicks'])
+                self.assertEqual(sum(item['state'] == state for item in outcome['shortPresses']), 1)
+                self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], attempted)
+                self.assertFalse(outcome['diagnosticWrites'][-1]['data']['automaticPayment'])
+
+    def test_click_is_used_only_when_short_touch_api_is_unavailable(self):
+        outcome = self.simulate('wechat_payment_sheet_full_flow_no_press', wechat=True)
+        self.assertEqual(outcome['state'], 'wechat')
+        self.assertEqual(outcome['shortPresses'], [])
+        record = outcome['diagnosticWrites'][-1]['data']
+        self.assertEqual(len(record['touchTimings']), len(outcome['clicks']))
+        self.assertTrue(all(item['pressDurationMs'] is None for item in record['touchTimings']))
 
     def test_unknown_actual_order_price_is_not_adopted_as_user_choice(self):
         outcome = self.simulate('wechat_preselected_price', wechat=True)
@@ -106,6 +153,107 @@ class AutoXLiveExportTests(unittest.TestCase):
         outcome = self.simulate('wechat_cashier_timeout', wechat=True)
         self.assertEqual(outcome['clicks'], ['立即购票', '提交订单', '立即支付'])
         self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'wechat_launch_unconfirmed')
+
+    def test_export_includes_only_digests_of_supported_partial_name_masks(self):
+        script = build_wechat_script(validate_profile(RAW_PROFILE))
+        target = json.loads(next(line for line in script.splitlines() if line.startswith('var TARGET = '))[13:-1])
+        masks = target['attendeeMaskedNameSha256']
+        for value in ('测***人', '测*人', '测＊＊＊人', '*试观演人', '测试观演*'):
+            with self.subTest(value=value):
+                self.assertIn(hashlib.sha256(value.encode('utf-8')).hexdigest(), masks)
+        for value in ('测试观演人', '*****', '*', '＊＊＊'):
+            with self.subTest(value=value):
+                self.assertNotIn(hashlib.sha256(value.encode('utf-8')).hexdigest(), masks)
+        self.assertEqual(len(masks), len(set(masks)))
+        self.assertTrue(all(len(value) == 64 and set(value) <= set('0123456789abcdef') for value in masks))
+        self.assertNotIn(json.dumps('测***人', ensure_ascii=True)[1:-1], script)
+        self.assertNotIn('测试观演人', str(self.simulate('wechat_masked_selected_sheet', wechat=True, amount=480)['diagnosticWrites']))
+
+    def test_checked_masked_attendee_is_preserved_and_submitted_once(self):
+        for scenario, clicks in [('wechat_masked_selected_sheet', ['立即购票', '立即支付', '确认支付']),
+                                 ('wechat_masked_fullwidth', ['立即购票', '立即支付'])]:
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, wechat=True, amount=480)
+                self.assertEqual(outcome['clicks'], clicks)
+                self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'wechat_payment_page')
+                self.assertFalse(outcome['diagnosticWrites'][-1]['data']['automaticPayment'])
+                self.assertNotIn('[观演人勾选框]', outcome['clicks'])
+                self.assertLessEqual(outcome['clicks'].count('确认支付'), 1)
+
+    def test_masked_attendee_requires_user_preselected_mode_and_checked_unique_identity(self):
+        for scenario in ['wechat_masked_unchecked', 'wechat_masked_wrong', 'wechat_masked_ambiguous',
+                         'wechat_masked_ambiguous_checkbox', 'wechat_masked_all_stars',
+                         'wechat_masked_changed_before_submit', 'wechat_masked_check_changed_before_submit']:
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, wechat=True, amount=480)
+                self.assertEqual(outcome['clicks'], ['立即购票'])
+                self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'not_submitted')
+                self.assertNotIn('[观演人勾选框]', outcome['clicks'])
+        outcome = self.simulate('wechat_masked_selected_sheet', payment=True, amount=480)
+        self.assertEqual(outcome['clicks'], ['立即购票'])
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'not_submitted')
+
+    def test_real_payment_order_sheet_uses_its_amount_and_launches_wechat_once(self):
+        for scenario in ['wechat_payment_sheet', 'wechat_payment_sheet_right_amount_background_wrong',
+                         'wechat_payment_sheet_split_amount', 'wechat_payment_sheet_sibling_selected']:
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, wechat=True, amount=480)
+                self.assertEqual(outcome['clicks'], ['立即购票', '立即支付', '确认支付'])
+                self.assertEqual(outcome['state'], 'wechat')
+                self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'wechat_payment_page')
+                self.assertFalse(outcome['diagnosticWrites'][-1]['data']['automaticPayment'])
+                self.assertEqual(next(iter(outcome['stored'].values()))['state'], 'wechat_launch_attempted')
+                self.assertEqual(outcome['clicks'].count('确认支付'), 1)
+                self.assertNotIn('微信支付', outcome['clicks'])
+
+    def test_payment_only_flow_stops_at_payment_order_sheet_without_launching_wechat(self):
+        outcome = self.simulate('payment_order_sheet', payment=True, amount=480)
+        self.assertEqual(outcome['clicks'], ['立即购票', '提交订单'])
+        self.assertEqual(outcome['state'], 'payment_sheet')
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'pending_payment_sheet')
+        self.assertEqual(next(iter(outcome['stored'].values()))['state'], 'submission_attempted')
+        self.assertNotIn('确认支付', outcome['clicks'])
+
+    def test_payment_order_sheet_does_not_accept_background_amount_or_unknown_container(self):
+        for scenario in ['wechat_payment_sheet_wrong_amount_background_right', 'wechat_payment_sheet_unbounded',
+                         'wechat_payment_sheet_bad_button_bounds', 'wechat_payment_sheet_disabled_button',
+                         'wechat_payment_sheet_missing_method', 'wechat_payment_sheet_ambiguous_amount',
+                         'wechat_payment_sheet_ambiguous_button', 'wechat_payment_sheet_amount_changed_before_review',
+                         'wechat_payment_sheet_wechat_unselected', 'wechat_payment_sheet_multiple_selected',
+                         'wechat_payment_sheet_method_changed', 'wechat_payment_sheet_ambiguous_method',
+                         'wechat_payment_sheet_autopay']:
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, wechat=True, amount=480)
+                self.assertEqual(outcome['clicks'], ['立即购票', '立即支付'])
+                self.assertEqual(outcome['state'], 'payment_sheet')
+                self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'payment_sheet_manual_required')
+                self.assertFalse(outcome['diagnosticWrites'][-1]['data']['automaticPayment'])
+                self.assertNotIn('确认支付', outcome['clicks'])
+
+    def test_payment_order_sheet_blocks_underlying_submit_and_further_congestion_refresh(self):
+        before_submit = self.simulate('wechat_payment_sheet_before_submit', wechat=True, amount=480)
+        self.assertEqual(before_submit['clicks'], ['立即购票'])
+        self.assertEqual(before_submit['diagnosticWrites'][-1]['data']['state'], 'not_submitted')
+        after_refresh = self.simulate('wechat_payment_sheet_during_congestion', wechat=True, amount=480)
+        self.assertEqual(after_refresh['clicks'], ['立即购票', '立即支付', '刷新', '确认支付'])
+        self.assertEqual(after_refresh['diagnosticWrites'][-1]['data']['state'], 'wechat_payment_page')
+        self.assertEqual(after_refresh['clicks'].count('确认支付'), 1)
+
+    def test_payment_order_sheet_uncertain_gateway_launch_is_never_retried(self):
+        for scenario, terminal in [('wechat_payment_sheet_launch_failed', 'wechat_launch_attempted'),
+                                   ('wechat_payment_sheet_launch_timeout', 'wechat_launch_unconfirmed')]:
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, wechat=True, amount=480)
+                self.assertEqual(outcome['clicks'], ['立即购票', '立即支付', '确认支付'])
+                self.assertEqual(outcome['state'], 'payment_sheet')
+                self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], terminal)
+                self.assertEqual(next(iter(outcome['stored'].values()))['state'], 'wechat_launch_attempted')
+                self.assertFalse(outcome['diagnosticWrites'][-1]['data']['automaticPayment'])
+
+    def test_attendee_checkbox_update_does_not_mark_wechat_method_selected(self):
+        outcome = self.simulate('wechat_cashier_unselected_after_attendee', wechat=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '[观演人勾选框]', '提交订单'])
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'cashier_manual_required')
 
     def test_wechat_foreground_is_not_mistaken_for_verified_payment(self):
         for scenario in ['wechat_chat', 'wechat_wrong_amount']:
@@ -254,6 +402,19 @@ class AutoXLiveExportTests(unittest.TestCase):
         # All decision reads skip geometry; only the fresh pre-click read
         # fetches the candidate button bounds.
         self.assertEqual(outcome['geometryReads']['detail'], 1)
+        self.assertEqual(outcome['sleeps'], [20000])
+
+    def test_hot_entry_discovery_and_enabled_check_share_one_fresh_decision_read(self):
+        outcome = self.simulate('slow_entry', payment=True)
+        record = outcome['diagnosticWrites'][-1]['data']
+        self.assertEqual(outcome['clicks'], ['立即购票', '提交订单'])
+        # The fifth slow read reveals the enabled control; a sixth scan would
+        # add 120 ms between discovery and the touch.
+        self.assertEqual(outcome['stateReads']['detail'], 5)
+        self.assertEqual(outcome['geometryReads']['detail'], 1)
+        self.assertEqual(record['entryDecisionReadMs'], 120)
+        self.assertEqual(record['entryDiscoveryToClickMs'], 0)
+        self.assertGreaterEqual(outcome['detailReadStartedAfterSaleMs'][-1], 0)
         self.assertEqual(outcome['sleeps'], [20000])
 
     def test_both_preselected_choices_skip_selection_and_one_detail_read(self):
@@ -405,13 +566,19 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertNotIn(50, outcome['sleeps'])
         self.assertTrue(any(0 < delay <= 80 for delay in outcome['sleeps']))
 
-    def test_sale_crossing_read_is_reused_but_actual_entry_is_still_revalidated(self):
+    def test_presale_crossing_read_requires_fresh_entry_decision_with_separate_read_cost(self):
         outcome = self.simulate('slow_countdown', payment=True)
         record = outcome['diagnosticWrites'][-1]['data']
         self.assertEqual(record['entryClickAfterSaleMs'], outcome['clickTimes'][0])
-        self.assertEqual(record['entryDiscoveryToClickMs'], 120)
+        self.assertEqual(record['entryDiscoveryToClickMs'], 0)
+        self.assertEqual(record['entryDecisionReadMs'], 120)
+        self.assertEqual(record['entryClickToNextPageObservedMs'], 120)
+        self.assertEqual(record['screenRootReadMs'] + record['screenTreeCopyMs'], record['screenReadMs'])
         self.assertGreaterEqual(record['entryClickAfterSaleMs'], 0)
-        # One crossing/discovery read plus one actual pre-click read, no third scan.
+        # The read that starts before sale is never used for the touch, even
+        # though retrieving that root takes 120 ms and crosses the sale time.
+        self.assertLess(outcome['detailReadStartedAfterSaleMs'][-2], 0)
+        self.assertGreaterEqual(outcome['detailReadStartedAfterSaleMs'][-1], 0)
         self.assertEqual(outcome['onSaleDetailReads'], 2)
 
     def test_challenge_in_fresh_read_after_countdown_prevents_entry_and_lock(self):
@@ -423,7 +590,18 @@ class AutoXLiveExportTests(unittest.TestCase):
     def test_sale_reached_during_sleep_does_not_reuse_presale_snapshot(self):
         outcome = self.simulate('sale_during_sleep', payment=True)
         self.assertGreaterEqual(outcome['clickTimes'][0], 0)
-        self.assertEqual(outcome['onSaleDetailReads'], 2)
+        self.assertEqual(outcome['onSaleDetailReads'], 1)
+        self.assertEqual(outcome['detailReadStartedAfterSaleMs'][-1], 0)
+
+    def test_challenge_appearing_during_sale_wait_blocks_entry_from_old_startup_tree(self):
+        outcome = self.simulate('sale_during_sleep_challenge', payment=True)
+        self.assertEqual(outcome['clicks'], [])
+        self.assertEqual(outcome['stored'], {})
+        self.assertEqual(outcome['lockFiles'], {})
+        self.assertEqual(outcome['onSaleDetailReads'], 1)
+        self.assertLess(outcome['detailReadStartedAfterSaleMs'][0], 0)
+        self.assertEqual(outcome['detailReadStartedAfterSaleMs'][-1], 0)
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['entryClickAfterSaleMs'], None)
 
     def test_congestion_refreshes_dialog_then_continues_without_repeated_submit(self):
         for scenario in ['congestion_before_order', 'congestion_after_submit']:
@@ -749,7 +927,12 @@ class AutoXLiveExportTests(unittest.TestCase):
         outcome = self.simulate('entry_enabled_later', payment=True)
         self.assertEqual(outcome['clicks'], ['立即购票', '提交订单'])
         self.assertEqual(outcome['clickTimes'][0], 21040)
-        self.assertEqual(outcome['stateReads']['detail'], 6)
+        # One startup label read and three fresh entry polls at +0/+20/+40 ms.
+        # Disabled polls do not claim or click; the first enabled poll does both.
+        self.assertEqual(outcome['stateReads']['detail'], 4)
+        self.assertEqual(outcome['geometryReads']['detail'], 3)
+        self.assertEqual(outcome['sleeps'], [20000, 20, 20])
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['entryDiscoveryToClickMs'], 0)
         self.assertEqual(len(outcome['lockFiles']), 1)
 
     def test_rehearsal_taps_price_but_never_confirms_or_claims_order(self):

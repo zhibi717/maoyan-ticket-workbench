@@ -44,10 +44,14 @@ var CAPTURE_SELECTION_ONLY = false;
     var screenReads = 0;
     var screenReadMs = 0;
     var screenReadMaxMs = 0;
+    var screenRootReadMs = 0;
+    var screenTreeCopyMs = 0;
     var readOrderFields = false;
     var readSelectionFields = false;
     var patterns = {};
     var lastScreenReadMs = 0;
+    var lastScreenReadStartedEpochMs = null;
+    var screenReadMode = null;
     var labelReads = 0;
     var preparedProbe = null;
     var terminalState = "not_submitted";
@@ -56,6 +60,8 @@ var CAPTURE_SELECTION_ONLY = false;
     var entryFoundEpochMs = null;
     var entryClickEpochMs = null;
     var entryClickCallMs = null;
+    var entryDecisionReadMs = null;
+    var entryNextPageEpochMs = null;
     var congestionRefreshes = 0;
     var lastCongestionRefreshMs = null;
     var congestionProbe = null;
@@ -67,6 +73,7 @@ var CAPTURE_SELECTION_ONLY = false;
     var screenPackage = PACKAGE;
     var wechatLaunchAttempted = false;
     var submittedAmount = null;
+    var touchTimings = [];
     function mark(name) {
         phase = name;
         marks.push(name + "=" + (Date.now() - timeOrigin) + "ms");
@@ -86,6 +93,7 @@ var CAPTURE_SELECTION_ONLY = false;
                     elapsedMs: Date.now() - timeOrigin,
                     screenReads: screenReads, screenReadMs: screenReadMs,
                     screenReadMaxMs: screenReadMaxMs,
+                    screenRootReadMs: screenRootReadMs, screenTreeCopyMs: screenTreeCopyMs,
                     congestionProbe: congestionProbe,
                     preparedProbe: preparedProbe,
                     message: line
@@ -97,13 +105,18 @@ var CAPTURE_SELECTION_ONLY = false;
                 files.write("/sdcard/Download/qiangpiao-payment-result.json", JSON.stringify({
                     finishedEpochMs: Date.now(), state: terminalState,
                     screenReads: screenReads, screenReadMs: screenReadMs,
+                    screenRootReadMs: screenRootReadMs, screenTreeCopyMs: screenTreeCopyMs,
                     entryFoundAfterSaleMs: entryFoundEpochMs === null ? null : entryFoundEpochMs - TARGET.saleEpochMs,
                     entryClickAfterSaleMs: entryClickEpochMs === null ? null : entryClickEpochMs - TARGET.saleEpochMs,
                     entryDiscoveryToClickMs: entryFoundEpochMs === null || entryClickEpochMs === null ? null :
                         entryClickEpochMs - entryFoundEpochMs,
                     entryClickCallMs: entryClickCallMs,
+                    entryDecisionReadMs: entryDecisionReadMs,
+                    entryClickToNextPageObservedMs: entryClickEpochMs === null || entryNextPageEpochMs === null ? null :
+                        entryNextPageEpochMs - entryClickEpochMs,
                     congestionRefreshes: congestionRefreshes,
                     wechatLaunchAttempted: wechatLaunchAttempted,
+                    touchTimings: touchTimings,
                     message: line, automaticPayment: false
                 }));
             } catch (ignoredResult) {}
@@ -111,6 +124,18 @@ var CAPTURE_SELECTION_ONLY = false;
     }
 
     function stop(message) { throw { safe: true, message: message }; }
+    function shortTouchOnce(x, y, stage) {
+        // The same short-touch API used by the verified local entry fixture.
+        // Every caller must validate its live control first. A failed dispatch
+        // is never followed by click() or another press, to avoid duplicates.
+        var started = Date.now();
+        var duration = typeof press === "function" ? 1 : null;
+        var result = duration !== null ? press(x, y, duration) : click(x, y);
+        if (touchTimings.length < 16) touchTimings.push({
+            stage: stage, callMs: Date.now() - started, pressDurationMs: duration
+        });
+        return result;
+    }
     // Shared methods avoid five new Rhino function objects per copied node.
     function rowBounds() { return this.area; }
     function rowText() { return this.label; }
@@ -124,6 +149,7 @@ var CAPTURE_SELECTION_ONLY = false;
         var started = Date.now();
         var root = auto.service.getRootInActiveWindow();
         var activePackage = root === null ? "" : String(root.getPackageName() || "");
+        var rootReadMs = Date.now() - started;
         if (root == null || activePackage !== PACKAGE &&
                 !(allowWechat && OPEN_WECHAT_PAYMENT && activePackage === "com.tencent.mm")) {
             screen = null;
@@ -193,11 +219,15 @@ var CAPTURE_SELECTION_ONLY = false;
             while (stack.length) stack.pop().raw.recycle();
         }
         screen = nodes;
+        screenReadMode = labelsOnly;
+        lastScreenReadStartedEpochMs = started;
         screenReads++;
         var elapsed = Date.now() - started;
         lastScreenReadMs = elapsed;
         if (labelsOnly) labelReads++;
         screenReadMs += elapsed;
+        screenRootReadMs += rootReadMs;
+        screenTreeCopyMs += Math.max(0, elapsed - rootReadMs);
         screenReadMaxMs = Math.max(screenReadMaxMs, elapsed);
     }
     function checkPackage(labelsOnly) { readScreen(labelsOnly); }
@@ -249,14 +279,14 @@ var CAPTURE_SELECTION_ONLY = false;
     }
     function checkBlockers() {
         if (hasAny(CHALLENGE)) stop("猫眼出现验证，请在手机手动处理并核对订单。");
-        if (hasAny(PAYMENT)) stop("猫眼出现支付页面，请在手机核对并自行付款。");
+        if (hasAny(PAYMENT) || hasPaymentOrderSheet()) stop("猫眼出现支付页面，请在手机核对并自行付款。");
         if (hasCongestion()) {
             if (!SUBMIT_TO_PAYMENT || FLOW_PRECHECK_ONLY || SELECTION_REHEARSAL) {
                 stop("当前有拥堵弹窗；只读或选档演练不会刷新，请在手机处理。");
             }
             recoverCongestion();
             if (hasAny(CHALLENGE)) stop("刷新后出现验证，请在手机手动处理。");
-            if (hasAny(PAYMENT)) stop("刷新后已到支付页面，请自行决定付款。");
+            if (hasAny(PAYMENT) || hasPaymentOrderSheet()) stop("刷新后已到支付页面，请自行决定付款。");
         }
     }
     function hasCongestion() {
@@ -309,7 +339,7 @@ var CAPTURE_SELECTION_ONLY = false;
             readScreen("refresh", allowWechat);
             if (screenPackage === "com.tencent.mm") return;
             if (hasAny(CHALLENGE)) stop("拥堵重试出现验证，请在手机手动完成。");
-            if (hasAny(PAYMENT) || has("待付款") && !has("实名观演人")) return;
+            if (hasAny(PAYMENT) || hasPaymentOrderSheet() || has("待付款") && !has("实名观演人")) return;
             if (!hasCongestion()) {
                 // Resume with a full fresh snapshot: SKU selection and order
                 // checkbox decisions must not use refresh-only properties.
@@ -400,10 +430,9 @@ var CAPTURE_SELECTION_ONLY = false;
         if (beforeClick) beforeClick();
         var clickStarted = Date.now();
         if (stage === "购票入口") entryClickEpochMs = clickStarted;
-        // Phone fixture: click() held the gesture for about 155 ms; a 1 ms
-        // press reached the button reliably. Keep the same fresh-page guards.
-        // Never fall back/retry after a failed or uncertain dispatched press.
-        var clicked = stage === "购票入口" && typeof press === "function" ? press(x, y, 1) : click(x, y);
+        // Reuse the short-touch dispatch for the guarded date, tier, confirm
+        // and order actions too. Page readiness is still observed separately.
+        var clicked = shortTouchOnce(x, y, stage);
         if (stage === "购票入口") entryClickCallMs = Date.now() - clickStarted;
         if (!clicked) stop(stage + "点击结果不明确，已停止；请在手机核对。");
         screen = null;
@@ -598,16 +627,24 @@ var CAPTURE_SELECTION_ONLY = false;
     function targetAttendeeBox() {
         var region = attendeeRegion();
         var labels = matchingPattern(/^.{1,50}$/, false);
-        var matches = [];
+        var matches = [], maskedMatches = [];
+        var maskedHashes = TARGET.attendeeMaskedNameSha256 || [];
         for (var i = 0; i < labels.length; i++) {
             var node = labels[i], b = node.bounds();
-            if (b.top >= region.top && b.bottom <= region.bottom &&
-                    nameDigest(String(node.text() || "").replace(/^\s+|\s+$/g, "")) === TARGET.attendeeNameSha256) {
-                matches.push(node);
-            }
+            if (b.top < region.top || b.bottom > region.bottom) continue;
+            var value = String(node.text() || "").replace(/^\s+|\s+$/g, "");
+            var digest = nameDigest(value);
+            if (digest === TARGET.attendeeNameSha256) matches.push(node);
+            else if (/[*＊]/.test(value) && value.replace(/[*＊]/g, "").length &&
+                    maskedHashes.indexOf(digest) >= 0) maskedMatches.push(node);
         }
-        unique(matches, "目标观演人");
-        return unique(orderCheckboxes(region), "唯一观演人勾选框");
+        var box = unique(orderCheckboxes(region), "唯一观演人勾选框");
+        if (matches.length === 1) return box;
+        if (matches.length > 1) stop("目标观演人未唯一识别，已停止。");
+        // A partial name is acceptable only for the user's already selected
+        // sole attendee. Never choose an unchecked person by a partial name.
+        if (USER_PRESELECTED && box.checked() && maskedMatches.length === 1) return box;
+        stop("目标观演人未唯一识别或掩码观演人未预选，已停止。");
     }
     function ensureOnlyAttendeeSelected() {
         readOrderFields = true;
@@ -619,8 +656,8 @@ var CAPTURE_SELECTION_ONLY = false;
         if (!box.enabled()) stop("观演人勾选框不可用，已停止。");
         safeButtonBounds(box, "观演人勾选框");
         var b = box.bounds();
-        if (!click(Math.floor((b.left + b.right) / 2),
-                   Math.floor((b.top + b.bottom) / 2))) {
+        if (!shortTouchOnce(Math.floor((b.left + b.right) / 2),
+                   Math.floor((b.top + b.bottom) / 2), "观演人勾选框")) {
             stop("观演人勾选结果不明确，已停止。");
         }
         mark("点击唯一观演人");
@@ -685,6 +722,7 @@ var CAPTURE_SELECTION_ONLY = false;
             }
             if (hasCongestion()) recoverCongestion();
             if (screenPackage === "com.tencent.mm") { finishAtWechat(); return; }
+            if (hasPaymentOrderSheet()) { finishAtPaymentOrderSheet(); return; }
             if (hasAny(PAYMENT) || has("待付款") && !has("实名观演人")) {
                 if (OPEN_WECHAT_PAYMENT) {
                     openWechatFromCashier();
@@ -699,6 +737,123 @@ var CAPTURE_SELECTION_ONLY = false;
         }
         terminalState = "submission_unconfirmed";
         stop("已提交一次，但未确认支付页面；请查看猫眼订单，程序不会重试或付款。");
+    }
+    function hasPaymentOrderSheet() {
+        // Do not require the amount to match before blocking the underlying
+        // order controls. A mismatched or unknown payment sheet also wins.
+        return has("支付订单") && has("支付剩余时间") && has("确认支付");
+    }
+    function paymentOrderSheetScope() {
+        var heading = unique(exactNodes(["支付订单"]), "支付订单标题");
+        var action = unique(exactNodes(["确认支付"]), "支付订单确认按钮");
+        safeButtonBounds(action, "支付订单按钮");
+        if (!action.enabled()) stop("支付订单按钮尚不可用，未继续支付。");
+        if (action.area.top < device.height * 0.70) stop("支付订单按钮位置异常，未继续支付。");
+        var parent = heading.parent();
+        for (var depth = 0; parent != null && depth < 12; depth++, parent = parent.parent()) {
+            var b = parent.area;
+            if (!b || b.left < 0 || b.top < device.height * 0.20 ||
+                    b.right > device.width || b.bottom > device.height ||
+                    b.right <= b.left || b.bottom <= b.top ||
+                    b.bottom < device.height * 0.75 ||
+                    b.bottom - b.top >= device.height * 0.75 || !isDescendantOf(action, parent)) continue;
+            var nodes = matching(function (node) { return isDescendantOf(node, parent); });
+            var timer = false, methods = false, underlyingOrder = false;
+            for (var i = 0; i < nodes.length; i++) {
+                var label = nodes[i].label + " " + nodes[i].description;
+                if (label.indexOf("支付剩余时间") >= 0) timer = true;
+                if (nodes[i].label === "支付方式" || nodes[i].description === "支付方式") methods = true;
+                if (/实名观演人|确认购票|确认购买|取票方式|配送方式/.test(label) ||
+                        label.indexOf(TARGET.titleToken) >= 0) underlyingOrder = true;
+            }
+            if (timer && methods && !underlyingOrder) return parent;
+        }
+        stop("支付订单弹窗边界未确认，未继续支付。");
+    }
+    function finishAtPaymentOrderSheet() {
+        terminalState = "payment_sheet_manual_required";
+        readOrderFields = true;
+        readScreen(false, OPEN_WECHAT_PAYMENT);
+        if (screenPackage === "com.tencent.mm") { finishAtWechat(); return; }
+        if (hasAny(CHALLENGE)) stop("支付订单弹窗出现验证，请在手机处理。");
+        if (!hasPaymentOrderSheet()) stop("支付订单弹窗已变化，请在手机核对。");
+        var scope = paymentOrderSheetScope();
+        var nodes = matching(function (node) { return isDescendantOf(node, scope); });
+        var amounts = [];
+        for (var i = 0; i < nodes.length; i++) {
+            var label = nodes[i].label.replace(/[,，]/g, "");
+            var pattern = /[¥￥]\s*(\d+(?:\.\d{1,2})?)/g, match;
+            while ((match = pattern.exec(label)) !== null) {
+                var value = Number(match[1]);
+                if (value > 0 && value <= 100000 && amounts.indexOf(value) < 0) amounts.push(value);
+            }
+            // Some layouts place the currency sign in a separate TextView.
+            if (/^\s*\d{1,6}\.\d{2}\s*$/.test(label)) {
+                var decimal = Number(label);
+                if (decimal > 0 && decimal <= 100000 && amounts.indexOf(decimal) < 0) amounts.push(decimal);
+            }
+        }
+        if (amounts.length !== 1 || amounts[0] !== TARGET.amount) {
+            stop("支付订单弹窗金额未确认或与目标不一致，未继续支付。");
+        }
+        if (OPEN_WECHAT_PAYMENT) {
+            launchWechatFromPaymentOrderSheet(scope);
+            return;
+        }
+        terminalState = "pending_payment_sheet";
+        mark("支付订单弹窗停止");
+        report("已识别目标金额的支付订单弹窗；脚本已停止，请自行决定付款。未点击确认支付。");
+    }
+    function sheetWechatSelected(scope) {
+        var labels = exactNodes(["微信支付"]).filter(function (node) { return isDescendantOf(node, scope); });
+        if (labels.length !== 1) return false;
+        var selected = matching(function (node) {
+            return isDescendantOf(node, scope) && node.isCheckable && node.checked();
+        });
+        if (selected.length !== 1) return false;
+        if (selected[0] === labels[0] || isDescendantOf(labels[0], selected[0])) return true;
+        // A radio circle can be a sibling of the method label. Accept only
+        // their short, bounded row, never the card containing other methods.
+        var parent = labels[0].parent();
+        for (var depth = 0; parent != null && depth < 8; depth++, parent = parent.parent()) {
+            var b = parent.area;
+            if (parent === scope) break;
+            if (b && b.bottom > b.top && b.bottom - b.top < device.height * 0.12 &&
+                    isDescendantOf(parent, scope) && isDescendantOf(selected[0], parent)) return true;
+        }
+        return false;
+    }
+    function launchWechatFromPaymentOrderSheet(scope) {
+        // This is the identified Maoyan merchant gateway after a submitted
+        // order, not the equally named final confirmation inside WeChat.
+        if (!SUBMIT_TO_PAYMENT || !USER_PRESELECTED || screenPackage !== PACKAGE ||
+                hasAny(["免密", "自动扣款", "先享后付", "输入支付密码"]) || !sheetWechatSelected(scope)) {
+            stop("支付订单弹窗未确认唯一已选微信方式，请在手机处理。");
+        }
+        var action = unique(exactNodes(["确认支付"]).filter(function (node) {
+            return isDescendantOf(node, scope) && node.enabled();
+        }), "猫眼微信跳转按钮");
+        if (wechatLaunchAttempted) stop("本次已尝试唤起微信，已停止；不会重复操作。");
+        safeButtonBounds(action, "猫眼微信跳转");
+        var b = action.bounds();
+        wechatLaunchAttempted = true;
+        terminalState = "wechat_launch_attempted";
+        storage.put(TARGET.attemptKey, { state: "wechat_launch_attempted", at: Date.now() });
+        if (!shortTouchOnce(Math.floor((b.left + b.right) / 2), Math.floor((b.top + b.bottom) / 2),
+                "猫眼支付订单微信跳转")) {
+            stop("猫眼微信跳转点击结果不明确，请自行核对；不会重复点击或付款。");
+        }
+        screen = null;
+        mark("猫眼支付订单跳转微信一次");
+        var deadline = Date.now() + 10000;
+        while (Date.now() < deadline) {
+            readScreen(true, true);
+            if (screenPackage === "com.tencent.mm") { finishAtWechat(); return; }
+            if (hasAny(CHALLENGE)) stop("跳转微信时出现验证，请在手机手动处理。");
+            pauseAfterRead(80);
+        }
+        terminalState = "wechat_launch_unconfirmed";
+        stop("已点击猫眼支付订单跳转，但未确认微信付款页；不会重复点击或付款。");
     }
     function paymentAmountMatches() {
         return matching(function (node) {
@@ -750,7 +905,8 @@ var CAPTURE_SELECTION_ONLY = false;
         wechatLaunchAttempted = true;
         terminalState = "wechat_launch_attempted";
         storage.put(TARGET.attemptKey, { state: "wechat_launch_attempted", at: Date.now() });
-        if (!click(Math.floor((b.left + b.right) / 2), Math.floor((b.top + b.bottom) / 2))) {
+        if (!shortTouchOnce(Math.floor((b.left + b.right) / 2), Math.floor((b.top + b.bottom) / 2),
+                "猫眼收银台微信跳转")) {
             stop("唤起微信的点击结果不明确；请自行核对，程序不会重试。");
         }
         mark("已尝试唤起微信一次");
@@ -1160,25 +1316,24 @@ var CAPTURE_SELECTION_ONLY = false;
         var entryDeadline = Date.now() + (SELECTION_REHEARSAL ? 5000 : 60000);
         var entryNode = null;
         while (Date.now() < entryDeadline) {
-            // Search labels first; geometry and state are fetched only when
-            // a candidate exists. Every action still gets a fresh full tree.
-            // When already on sale, the initial preflight is also the first
-            // entry search. This is a decision-only reuse: the actual tap
-            // still re-reads and validates the live page below.
-            if (!reuseInitialEntryDecision) checkPackage(true);
+            // Fetch one fresh entry snapshot per poll: all labels for the
+            // identity/challenge guards, geometry/state only for real entry
+            // candidates. Do not traverse another entire tree just because a
+            // candidate appeared. A read started before sale is never a tap
+            // snapshot, even when that read happened to finish after sale.
+            if (!reuseInitialEntryDecision || screenReadMode !== "entry" ||
+                    lastScreenReadStartedEpochMs < TARGET.saleEpochMs) checkPackage("entry");
             reuseInitialEntryDecision = false;
             verifyDetail(false, true);
             var possibleEntry = entryNodes();
             if (possibleEntry.length > 1) stop("购票入口出现多个候选，已停止。");
             if (possibleEntry.length === 1) {
                 entryFoundEpochMs = Date.now();
-                // This is the final fresh pre-click read. A label can appear
-                // before its control becomes enabled; observe rather than abort.
-                verifyDetail(false, false, true);
-                var freshEntries = entryNodes();
-                if (freshEntries.length > 1) stop("购票入口出现多个候选，已停止。");
-                if (freshEntries.length === 1 && freshEntries[0].enabled()) {
-                    entryNode = freshEntries[0];
+                // The same fresh snapshot already contains the state and
+                // bounds. If still disabled, observe a new snapshot next poll.
+                if (possibleEntry[0].enabled()) {
+                    entryNode = possibleEntry[0];
+                    entryDecisionReadMs = lastScreenReadMs;
                     break;
                 }
             }
@@ -1195,6 +1350,7 @@ var CAPTURE_SELECTION_ONLY = false;
         mark("点击购票入口");
 
         var kind = waitForKind(5000);
+        entryNextPageEpochMs = Date.now();
         mark(kind === "sku" ? "识别选票页" : "识别订单页");
         if (kind === "order") {
             finishAtOrder();

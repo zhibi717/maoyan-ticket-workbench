@@ -20,6 +20,19 @@ CONGESTION_PROBE_OUTPUT = DATA / 'autox-maoyan-congestion-probe.js'
 CAPTURE_OUTPUT = DATA / 'autox-maoyan-selection-capture.js'
 
 
+def masked_name_hashes(name: str) -> list[str]:
+    """Accept common star masks without exporting any readable name fragment."""
+    variants = set()
+    for start in range(len(name)):
+        for end in range(start + 1, len(name) + 1):
+            if start == 0 and end == len(name):
+                continue
+            for symbol in ('*', '＊'):
+                for count in {1, end - start}:
+                    variants.add(name[:start] + symbol * count + name[end:])
+    return sorted(hashlib.sha256(value.encode('utf-8')).hexdigest() for value in variants)
+
+
 def build_locked_prototype(profile: dict, template: str | None = None) -> str:
     """Build a one-ticket script with a local name digest, never a plaintext name."""
     event = target_from_profile(profile)
@@ -37,6 +50,7 @@ def build_locked_prototype(profile: dict, template: str | None = None) -> str:
         **event,
         'attendeeCount': 1,
         'attendeeNameSha256': hashlib.sha256(attendee.strip().encode('utf-8')).hexdigest(),
+        'attendeeMaskedNameSha256': masked_name_hashes(attendee.strip()),
         'saleEpochMs': sale_ms,
         'attemptKey': f'{identifier}:{sale_ms}',
         'selectionSource': profile.get('selection_source', 'workbench'),
