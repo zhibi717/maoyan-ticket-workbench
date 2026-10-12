@@ -16,7 +16,7 @@
 
 工作台另提供选票档演练（不确认不下单）和拥堵只读检查（不点击），只读与演练不占用正式尝试锁。正式脚本在AutoX私有目录保存单次尝试标记，出现不确定结果须先核对猫眼订单。
 
-工具tools/autox_first_click_benchmark.js仅在AutoX本地界面测按钮启用至触摸回调，不操作猫眼或微信。需约20秒前台不操作手机，成功显示Complete:24 local trials，结果在手机下载目录qiangpiao-first-click-benchmark.json。详见docs/优化验收-20261012.md。
+工作台“手机按钮测速（不操作购票）”入口传送tools/autox_first_click_benchmark.js的独立测试文件。手机点运行后保持AutoX自带测试页前台约20秒，不切到猫眼；成功显示Complete:24 local trials，结果在手机下载目录qiangpiao-first-click-benchmark.json。测试仅测本地按钮启用至触摸回调，不操作猫眼或微信，也不占用正式尝试锁。正式开售时不运行测速，结果不是实际抢票总用时。详见docs/优化验收-20261012.md和docs/协作者改动复核-20261012.md。
 
 尚未完成真实开售、创建订单及微信SDK跳转的整条真机验收；局部测速和离线测试不能保证抢票概率或最快。更新工作台后须重新传送正式脚本，避免运行手机历史旧文件。
 

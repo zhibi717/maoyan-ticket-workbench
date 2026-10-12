@@ -202,6 +202,41 @@ class ApiTests(unittest.TestCase):
                 self.assertTrue(json.load(response)['ok'])
             self.assertEqual(open_phone.call_args.args[0]['selection_source'], 'phone')
 
+    def test_benchmark_route_opens_only_explicitly_and_requires_authentication(self):
+        profile={**PROFILE,'platform':'maoyan','users':['测试甲']}
+        with self.request('/api/profile/save',profile):
+            pass
+        with patch('ticketdesk.autox_phone.open_first_click_benchmark_on_phone') as open_phone:
+            with self.request('/api/state') as response:
+                self.assertFalse(json.load(response)['busy'])
+            open_phone.assert_not_called()
+            for kwargs in ({'token':False},{'origin':'https://example.com'}):
+                with self.assertRaises(urllib.error.HTTPError) as exc:
+                    self.request('/api/autox/benchmark/open',{},**kwargs)
+                self.assertEqual(exc.exception.code,403)
+            open_phone.assert_not_called()
+            with self.request('/api/autox/benchmark/open',{}) as response:
+                self.assertTrue(json.load(response)['ok'])
+            open_phone.assert_called_once()
+
+    def test_benchmark_rejects_wrong_platform_and_running_task(self):
+        with patch('ticketdesk.autox_phone.open_first_click_benchmark_on_phone') as open_phone:
+            with self.request('/api/profile/save',PROFILE):
+                pass
+            with self.assertRaises(urllib.error.HTTPError) as exc:
+                self.request('/api/autox/benchmark/open',{})
+            self.assertEqual(exc.exception.code,400)
+            with self.request('/api/profile/save',{**PROFILE,'platform':'maoyan'}):
+                pass
+            self.server.controller.state['busy']=True
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as exc:
+                    self.request('/api/autox/benchmark/open',{})
+                self.assertEqual(exc.exception.code,400)
+            finally:
+                self.server.controller.state['busy']=False
+            open_phone.assert_not_called()
+
     def test_maoyan_usb_order_route_is_disabled(self):
         profile = {**PROFILE, 'platform': 'maoyan', 'users': ['测试甲'],
                    'sale_time': '2026-10-20T15:00:00+08:00'}

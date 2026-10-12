@@ -16,6 +16,8 @@ OUTPUT = DATA / 'autox-maoyan-live.js'
 PHONE_OUTPUT = '/sdcard/Download/autox-maoyan-live.js'
 REHEARSAL_PHONE_OUTPUT = '/sdcard/Download/autox-maoyan-rehearsal.js'
 AUTOX_ACTIVITY = 'org.autojs.autoxjs.v7/org.autojs.autojs.external.open.OpenIntentActivity'
+BENCHMARK_SOURCE = ROOT / 'tools' / 'autox_first_click_benchmark.js'
+BENCHMARK_OUTPUT = DATA / 'autox-first-click-benchmark.js'
 
 
 def _run(args: list[str]) -> str:
@@ -56,6 +58,16 @@ def open_selection_capture_on_phone(profile: dict, *, adb: Path = ADB,
     """Open a read-only capture; no entry, selection or order action."""
     _open_script_on_phone(profile, build_selection_capture_script(profile), adb=adb,
                           output=output, phone_output='/sdcard/Download/autox-maoyan-selection-capture.js', run=run)
+
+
+def open_first_click_benchmark_on_phone(profile: dict, *, adb: Path = ADB,
+                                        output: Path = BENCHMARK_OUTPUT,
+                                        source: Path = BENCHMARK_SOURCE, run=_run) -> None:
+    """Open the separate AutoX fixture; no ticket profile is embedded or run."""
+    if not source.is_file():
+        raise ValueError('手机按钮测速工具缺失，请重新安装工作台。')
+    _open_script_on_phone(profile, source.read_text(encoding='utf-8'), adb=adb,
+                          output=output, phone_output='/sdcard/Download/autox-first-click-benchmark.js', run=run)
 
 
 def _open_script_on_phone(profile: dict, script: str, *, adb: Path, output: Path,

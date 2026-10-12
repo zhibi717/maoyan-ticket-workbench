@@ -93,6 +93,18 @@ class Controller:
             self.state['status'] = '已在手机打开 AutoX 脚本；点“运行脚本”并切回目标页。核对票档、1 张和指定观演人后，仅提交明确的订单按钮一次，尝试进入微信付款页后停止，不付款。'
             self.log('AutoX 脚本已打开；核对订单及观演人后提交一次，尝试到微信付款页后停止；确认购票页支持立即支付；收银台需确认微信方式，进入微信后停止。')
 
+    def open_autox_benchmark(self):
+        with self.lock:
+            if self.state['busy']:
+                raise ValueError('请先停止正在运行的任务。')
+            profile = self.selected_profile()
+            if profile['platform'] != 'maoyan':
+                raise ValueError('请先选中猫眼演出，再打开手机按钮测速。')
+            from .autox_phone import open_first_click_benchmark_on_phone
+            open_first_click_benchmark_on_phone(profile)
+            self.state['status'] = '已打开独立测速脚本；在手机点运行，保持 AutoX 测试页前台约 20 秒。测试仅点击自带按钮，不操作猫眼、订单或付款。'
+            self.log('独立手机按钮测速已打开；不要切到猫眼。测速结果不代表抢票总用时。')
+
     def open_autox_selection_capture(self):
         with self.lock:
             if self.state['busy']:

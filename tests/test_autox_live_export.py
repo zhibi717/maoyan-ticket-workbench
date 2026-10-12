@@ -9,7 +9,8 @@ from pathlib import Path
 from ticketdesk.autox_live_export import (build_flow_probe_script, build_live_script, build_locked_prototype,
                                           build_selection_rehearsal_script, build_payment_script, build_congestion_probe_script, build_wechat_script,
                                           build_selection_capture_script)
-from ticketdesk.autox_phone import open_live_on_phone, open_rehearsal_on_phone
+from ticketdesk.autox_phone import (open_live_on_phone, open_rehearsal_on_phone,
+                                    open_first_click_benchmark_on_phone)
 from ticketdesk.profiles import validate_profile
 
 
@@ -566,6 +567,36 @@ class AutoXLiveExportTests(unittest.TestCase):
                 open_live_on_phone(profile, adb=adb, output=Path(tmp) / 'live.js',
                                    run=fake_run)
         self.assertEqual(len(calls), 1)
+
+    def test_benchmark_transfer_is_separate_and_does_not_embed_private_profile(self):
+        profile = validate_profile({**RAW_PROFILE, 'serial': ''})
+        calls=[]
+        def fake_run(args):
+            calls.append(args)
+            return 'List of devices attached\nphone-1\tdevice\n' if args[1:] == ['devices'] else ''
+        with tempfile.TemporaryDirectory() as tmp:
+            adb=Path(tmp)/'adb.exe'; adb.touch()
+            live=Path(tmp)/'live.js'; live.write_text('unchanged purchase script',encoding='utf-8')
+            output=Path(tmp)/'benchmark.js'
+            open_first_click_benchmark_on_phone(profile,adb=adb,output=output,run=fake_run)
+            body=output.read_text(encoding='utf-8')
+            self.assertIn('org.autojs.autoxjs.v7',body)
+            self.assertNotIn(RAW_PROFILE['users'][0],body)
+            self.assertNotIn('attendeeNameSha256',body)
+            self.assertNotIn('private-device-serial',body)
+            self.assertNotIn('var TARGET =',body)
+            self.assertEqual(live.read_text(encoding='utf-8'),'unchanged purchase script')
+        self.assertEqual(calls[1][-1],'/sdcard/Download/autox-first-click-benchmark.js')
+        self.assertEqual(calls[2][1:6],['-s','phone-1','shell','am','start'])
+        self.assertEqual(len(calls),3)
+
+    def test_missing_benchmark_fails_before_any_phone_command(self):
+        calls=[]
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                open_first_click_benchmark_on_phone(validate_profile(RAW_PROFILE),
+                    source=Path(tmp)/'missing.js',run=lambda args:calls.append(args))
+        self.assertEqual(calls,[])
 
     def test_phone_rehearsal_uses_separate_file(self):
         profile = validate_profile({**RAW_PROFILE, 'serial': ''})
