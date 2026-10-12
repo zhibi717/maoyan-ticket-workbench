@@ -27,6 +27,7 @@ let rectAllocations = 0;
 let congestionVisible = scenario.startsWith('probe_congestion');
 let refreshCount = 0;
 let congestionNonRefreshGeometryReads = 0;
+let congestionUnderlyingGeometryReads = 0;
 let hashComputations = 0;
 let regexCompilations = 0;
 const clicks = [];
@@ -87,11 +88,11 @@ function item(label, index) {
             (['sku_already_target', 'retained_tier_changed', 'retained_date_changed',
               'prepared_to_sku', 'prepared_to_sku_no_change'].includes(scenario) &&
                 label === '看台 ¥' + target.amount), bounds: {
-        left: confirmation ? 640 + index * 10 : 20 + index * 2,
-        top: confirmation ? 2070 + index * 5 :
+        left: label === '刷新' && congestionVisible ? 500 : confirmation ? 640 + index * 10 : 20 + index * 2,
+        top: label === '刷新' && congestionVisible ? 850 : confirmation ? 2070 + index * 5 :
             label.indexOf('立即') === 0 || label === '提交订单' ? 2100 : 400 + index * 70,
-        right: confirmation ? 990 + index * 10 : 600 + index * 2,
-        bottom: confirmation ? 2180 + index * 5 :
+        right: label === '刷新' && congestionVisible ? 800 : confirmation ? 990 + index * 10 : 600 + index * 2,
+        bottom: label === '刷新' && congestionVisible ? 920 : confirmation ? 2180 + index * 5 :
             label.indexOf('立即') === 0 || label === '提交订单' ? 2210 : 450 + index * 70
     }};
 }
@@ -302,6 +303,8 @@ function nativeRow(row, children) {
         getClassName: () => { propertyReads.className++; return row.className || 'android.view.View'; },
         getBoundsInScreen: rect => {
             if (congestionVisible && row.text !== '刷新') congestionNonRefreshGeometryReads++;
+            if (congestionVisible && row.text && row.text !== '刷新' &&
+                    !/前方拥堵|请刷新重试/.test(row.text)) congestionUnderlyingGeometryReads++;
             geometryReads[state] = (geometryReads[state] || 0) + 1;
             Object.assign(rect, row.bounds);
         },
@@ -343,13 +346,41 @@ function nativeRoot() {
         records.forEach(row => { if (row.checkable) row.checked = false; });
     }
     const children = [];
+    const dialogChildren = [];
     for (const row of records) {
+        if (congestionVisible && /前方拥堵|请刷新重试/.test(row.text)) {
+            row.bounds = {left: 200, top: 720, right: 850, bottom: 790};
+            if (scenario === 'congestion_description_hints') {
+                row.desc = row.text;
+                row.text = '';
+            }
+            dialogChildren.push(nativeRow(row));
+            continue;
+        }
+        if (congestionVisible && row.text === '刷新' && scenario !== 'congestion_background_refresh_only') {
+            row.bounds = {left: 500, top: 850, right: 800, bottom: 920};
+            dialogChildren.push(nativeRow(row));
+            continue;
+        }
         if (scenario === 'sold_out_sibling' && row.text === '缺货登记') continue;
         if (scenario === 'sold_out_sibling' && row.text === '看台 ¥' + target.amount) {
             children.push(nativeRow({text: '', enabled: true,
                 bounds: {left: 10, top: 500, right: 700, bottom: 770}},
                 [nativeRow(row), nativeRow(records.find(record => record.text === '缺货登记'))]));
         } else children.push(nativeRow(row));
+    }
+    if (dialogChildren.length) {
+        if (scenario === 'congestion_unbounded_dialog') {
+            children.push(...dialogChildren);
+        } else {
+            const frame = {text: '', enabled: true,
+                bounds: {left: 140, top: 650, right: 920, bottom: 1000}};
+            children.push(nativeRow(frame, dialogChildren));
+            if (scenario === 'congestion_dialog_with_background_refresh') {
+                children.push(nativeRow({text: '刷新', enabled: true,
+                    bounds: {left: 10, top: 1500, right: 200, bottom: 1550}}));
+            }
+        }
     }
     return nativeRow({text: '', enabled: true,
         bounds: {left: 0, top: 0, right: 1080, bottom: 2400}}, children);
@@ -413,5 +444,5 @@ context.press = (x, y, duration) => {
     return context.click(x, y);
 };
 vm.runInNewContext(script, context, { timeout: 2000 });
-process.stdout.write(JSON.stringify({ shortPresses, clicks, clickTimes, onSaleDetailReads, logs, stored, lockFiles, state, treeReads, selectorReads, diagnosticWrites, propertyReads, geometryReads, stateReads, sleeps, rectAllocations, congestionNonRefreshGeometryReads, hashComputations, regexCompilations }));
+process.stdout.write(JSON.stringify({ shortPresses, clicks, clickTimes, onSaleDetailReads, logs, stored, lockFiles, state, treeReads, selectorReads, diagnosticWrites, propertyReads, geometryReads, stateReads, sleeps, rectAllocations, congestionNonRefreshGeometryReads, congestionUnderlyingGeometryReads, hashComputations, regexCompilations }));
 

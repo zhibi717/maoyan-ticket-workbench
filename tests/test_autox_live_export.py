@@ -437,11 +437,11 @@ class AutoXLiveExportTests(unittest.TestCase):
 
     def test_refresh_loop_only_reads_refresh_geometry_and_restores_order_fields(self):
         outcome = self.simulate('congestion_after_submit', payment=True)
-        self.assertEqual(outcome['congestionNonRefreshGeometryReads'], 0)
+        self.assertEqual(outcome['congestionUnderlyingGeometryReads'], 0)
         self.assertEqual(outcome['clicks'].count('刷新'), 3)
         self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'payment_page')
         outcome = self.simulate('congestion_before_order', payment=True)
-        self.assertLessEqual(outcome['congestionNonRefreshGeometryReads'], 16)
+        self.assertLessEqual(outcome['congestionUnderlyingGeometryReads'], 16)
         self.assertEqual(outcome['clicks'].count('提交订单'), 1)
 
     def test_computation_cache_reduces_hashes_but_checks_fresh_attendee_name(self):
@@ -462,6 +462,24 @@ class AutoXLiveExportTests(unittest.TestCase):
                 self.assertEqual(outcome['clicks'].count('刷新'), clicks)
                 self.assertNotIn('提交订单', outcome['clicks'])
                 self.assertNotIn('立即支付', outcome['clicks'])
+
+    def test_refresh_requires_the_button_and_hints_in_one_bounded_dialog(self):
+        for scenario in ['congestion_background_refresh_only', 'congestion_unbounded_dialog']:
+            with self.subTest(scenario=scenario):
+                result = self.simulate(scenario, payment=True)
+                self.assertNotIn('刷新', result['clicks'])
+                self.assertNotIn('提交订单', result['clicks'])
+                self.assertTrue(any('弹窗内刷新按钮' in log for log in result['logs']))
+
+    def test_dialog_refresh_is_distinguished_from_the_same_label_on_background(self):
+        result = self.simulate('congestion_dialog_with_background_refresh', payment=True)
+        self.assertEqual(result['clicks'].count('刷新'), 3)
+        self.assertEqual(result['clicks'].count('提交订单'), 1)
+
+    def test_description_only_congestion_hints_still_belong_to_dialog(self):
+        result = self.simulate('congestion_description_hints', payment=True)
+        self.assertEqual(result['clicks'].count('刷新'), 3)
+        self.assertEqual(result['clicks'].count('提交订单'), 1)
 
     def test_persistent_congestion_stops_at_sale_window_without_submitting(self):
         outcome = self.simulate('congestion_forever', payment=True)

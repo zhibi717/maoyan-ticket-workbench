@@ -146,7 +146,8 @@ var CAPTURE_SELECTION_ONLY = false;
                     var description = String(raw.getContentDescription() || "");
                     var needsGeometry = !labelsOnly || labelsOnly === "entry" &&
                         (ENTRY_PATTERN.test(label) || ENTRY_PATTERN.test(description)) ||
-                        labelsOnly === "refresh" && (label === "刷新" || description === "刷新");
+                        labelsOnly === "refresh" && (label === "刷新" || description === "刷新" ||
+                            !label && !description || /前方拥堵|请刷新重试/.test(label + description));
                     if (labelsOnly === "prepared") needsGeometry = ENTRY_PATTERN.test(label) ||
                         ENTRY_PATTERN.test(description) || SKU_CONFIRM.indexOf(label) >= 0 ||
                         SKU_CONFIRM.indexOf(description) >= 0;
@@ -261,6 +262,44 @@ var CAPTURE_SELECTION_ONLY = false;
     function hasCongestion() {
         return has("前方拥堵") && has("请刷新重试");
     }
+    function isDescendantOf(node, ancestor) {
+        for (var depth = 0; node != null && depth < 32; depth++, node = node.parent()) {
+            if (node === ancestor) return true;
+        }
+        return false;
+    }
+    function congestionRefreshNodes() {
+        var buttons = exactNodes(["刷新"]);
+        var headings = matchingPattern(/前方拥堵/, true);
+        var prompts = matchingPattern(/请刷新重试/, true);
+        return buttons.filter(function (button) {
+            var parent = button.parent(), buttonBounds = button.area;
+            for (var depth = 0; parent != null && depth < 12; depth++, parent = parent.parent()) {
+                var b = parent.area;
+                // The window root is not proof of belonging to a dialog.
+                // Require a bounded common container for the hints and button.
+                if (!b || !buttonBounds || b.left < 0 || b.top < 0 ||
+                        b.right > device.width || b.bottom > device.height ||
+                        b.right <= b.left || b.bottom <= b.top ||
+                        b.bottom - b.top >= device.height * 0.70 ||
+                        b.right - b.left >= device.width * 0.98 ||
+                        b.left > buttonBounds.left || b.right < buttonBounds.right ||
+                        b.top > buttonBounds.top || b.bottom < buttonBounds.bottom) continue;
+                var headingInside = headings.some(function (node) { return isDescendantOf(node, parent); });
+                var promptInside = prompts.some(function (node) { return isDescendantOf(node, parent); });
+                if (!headingInside || !promptInside) continue;
+                var underlying = matching(function (node) {
+                    var identity = node.label + " " + node.description;
+                    return isDescendantOf(node, parent) &&
+                        (identity.indexOf(TARGET.titleToken) >= 0 || node.label === TARGET.city ||
+                         node.description === TARGET.city ||
+                         /实名观演人|选择票档|提交订单|立即支付|取票方式|配送方式/.test(identity));
+                });
+                if (!underlying.length) return true;
+            }
+            return false;
+        });
+    }
     function recoverCongestion() {
         var deadline = TARGET.saleEpochMs + 1200000;
         while (Date.now() < deadline) {
@@ -283,7 +322,7 @@ var CAPTURE_SELECTION_ONLY = false;
                 stop("拥堵弹窗下未确认目标订单或票档，已停止刷新。");
             }
             if (congestionRefreshes >= 3000) stop("拥堵刷新已达本次上限，已停止；请在手机核对。");
-            var refresh = unique(exactNodes(["刷新"]), "拥堵刷新按钮");
+            var refresh = unique(congestionRefreshNodes(), "拥堵弹窗内刷新按钮");
             if (!refresh.enabled()) {
                 pauseAfterRead(80);
                 continue;
@@ -1027,7 +1066,7 @@ var CAPTURE_SELECTION_ONLY = false;
             if (CONGESTION_PRECHECK_ONLY) {
                 if (hasAny(CHALLENGE)) stop("只读拥堵检查发现验证，请在手机处理；未点击。");
                 if (hasAny(PAYMENT)) stop("只读拥堵检查发现支付页；未点击。");
-                var buttons = exactNodes(["刷新"]);
+                var buttons = congestionRefreshNodes();
                 congestionProbe = {
                     present: hasCongestion(),
                     targetMatches: orderIdentityMatches() || has("选择票档") && dateNodes().length === 1,
