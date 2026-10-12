@@ -95,6 +95,31 @@ def build_payment_script(profile: dict, template: str | None = None) -> str:
     return script.replace(gate, 'var SUBMIT_TO_PAYMENT = true;', 1)
 
 
+def build_fixed_coordinate_payment_script(profile: dict, coordinates: dict,
+                                          template: str | None = None) -> str:
+    """Timed first taps, then guarded order and Maoyan-to-WeChat submission."""
+    width = coordinates.get('width')
+    height = coordinates.get('height')
+    gap = coordinates.get('gapMs')
+    if width != 1080 or height != 2376 or not isinstance(gap, int) or not 1 <= gap <= 1000:
+        raise ValueError('固定坐标模式仅支持已核对的 1080×2376 手机和 1–1000 毫秒间隔。')
+    points = {}
+    for stage in ('entry', 'tier', 'confirm'):
+        point = coordinates.get(stage)
+        if (not isinstance(point, (list, tuple)) or len(point) != 2 or
+                not all(isinstance(value, int) and not isinstance(value, bool) for value in point) or
+                not 0 <= point[0] < width or not 0 <= point[1] < height):
+            raise ValueError(f'{stage} 坐标无效。')
+        points[stage] = list(point)
+    script = build_wechat_script(profile, template)
+    gates = ('var FAST_FIXED_PATH = false;', 'var FAST_COORDS = null;')
+    if any(script.count(gate) != 1 for gate in gates):
+        raise RuntimeError('固定坐标模式开关异常。')
+    config = {'width': width, 'height': height, 'gapMs': gap, **points}
+    return (script.replace(gates[0], 'var FAST_FIXED_PATH = true;', 1)
+            .replace(gates[1], f'var FAST_COORDS = {json.dumps(config, separators=(",", ":"))};', 1))
+
+
 def build_wechat_script(profile: dict, template: str | None = None) -> str:
     """Create an order, launch the verified WeChat route once, never pay."""
     script = build_payment_script(profile, template)

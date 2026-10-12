@@ -15,6 +15,9 @@ const actualAmount = scenario.startsWith('wechat_preselected_price') || scenario
 const chosenAmount = scenario.startsWith('phone_') ? 580 : target.amount;
 let now = target.saleEpochMs + 1000;
 if (['spaced_reservation', 'slow_countdown', 'slow_countdown_challenge'].includes(scenario)) now = target.saleEpochMs - 30000;
+if (scenario === 'fixed_reservation_switches') now = target.saleEpochMs - 30000;
+if (scenario === 'fixed_reservation_already_switched') now = target.saleEpochMs - 21000;
+if (scenario.startsWith('presale_reservation_')) now = target.saleEpochMs - 21000;
 if (scenario === 'sale_during_sleep' || scenario === 'sale_during_sleep_challenge') now = target.saleEpochMs - 20060;
 let state = 'detail';
 if (scenario.startsWith('prepared_')) state = 'prepared';
@@ -121,7 +124,11 @@ function rows() {
         });
     }
     if (state === 'detail') {
-        const labels = [target.titleToken, target.city, '已预约', '立即购票'];
+        const labels = [target.titleToken, target.city,
+            scenario.startsWith('fixed_reservation_') && now >= target.saleEpochMs - 1000 ? '开售' : '已预约',
+            '立即购票'];
+        if (scenario.startsWith('presale_reservation_')) labels[2] = '开售';
+        if (scenario === 'presale_reservation_missing_no_entry') labels.pop();
         if (scenario === 'slow_entry' && stateReads.detail < 5) labels.pop();
         if (scenario === 'fast_entry' && now < target.saleEpochMs + 21030) labels.pop();
         if (state === 'detail' && ['challenge_before_entry', 'wrong_detail_before_entry'].includes(scenario) && stateReads.detail >= 2) {
@@ -292,6 +299,8 @@ function clickRow(row) {
         if (scenario.startsWith('prepared_to_sku')) state = 'sku_selected';
         else if (scenario !== 'prepared_no_change') state = 'order';
     } else if (state === 'detail' && row.text === '立即购票') {
+        if (scenario === 'entry_first_touch_ignored' &&
+                clicks.filter(label => label === '立即购票').length === 1) return true;
         state = ['sku_already_chosen', 'sku_already_target', 'retained_tier_changed', 'retained_date_changed'].includes(scenario) ? 'sku_selected' :
             ['sku', 'sku_preselected', 'sold_out_sku', 'price_click_no_change',
              'duplicate_price_sku', 'wrong_quantity_after_price',
@@ -491,7 +500,7 @@ const context = {
     },
     sleep: ms => { sleeps.push(ms); now += ms; },
     Date: { now: () => now },
-    device: { width: 1080, height: 2400 },
+    device: { width: 1080, height: scenario.startsWith('fixed_reservation_') ? 2376 : 2400 },
     currentPackage: () => scenario === 'stale_current_package' ? 'com.android.launcher' : target.package,
     text: value => selector('text', value),
     desc: value => selector('desc', value),

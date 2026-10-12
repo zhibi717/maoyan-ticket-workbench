@@ -9,7 +9,7 @@ from pathlib import Path
 
 from ticketdesk.autox_live_export import (build_flow_probe_script, build_live_script, build_locked_prototype,
                                           build_selection_rehearsal_script, build_payment_script, build_congestion_probe_script, build_wechat_script,
-                                          build_selection_capture_script)
+                                          build_selection_capture_script, build_fixed_coordinate_payment_script)
 from ticketdesk.autox_phone import (open_live_on_phone, open_rehearsal_on_phone,
                                     open_first_click_benchmark_on_phone)
 from ticketdesk.profiles import validate_profile
@@ -31,6 +31,54 @@ RAW_PROFILE = {
 
 
 class AutoXLiveExportTests(unittest.TestCase):
+    def test_fixed_coordinate_build_is_separate_and_guards_final_order(self):
+        profile = validate_profile(RAW_PROFILE)
+        points = {'width': 1080, 'height': 2376, 'gapMs': 5,
+                  'entry': [600, 2240], 'tier': [290, 1380], 'confirm': [860, 2240]}
+        script = build_fixed_coordinate_payment_script(profile, points)
+        self.assertIn('var FAST_FIXED_PATH = true;', script)
+        self.assertIn('var OPEN_WECHAT_PAYMENT = true;', script)
+        self.assertIn('var FAST_COORDS = {"width":1080,"height":2376,"gapMs":5', script)
+        self.assertIn('if (pageKind() === "order")', script)
+        self.assertIn('finishAtOrder();', script)
+        self.assertIn('orderIdentityMatches()', script)
+        self.assertIn('stop("固定点击后未确认进入目标订单页', script)
+        with self.assertRaises(ValueError):
+            build_fixed_coordinate_payment_script(profile, {**points, 'tier': [1080, 1380]})
+        with self.assertRaises(ValueError):
+            build_fixed_coordinate_payment_script(profile, {**points, 'width': 720})
+        node = shutil.which('node')
+        if node:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'fixed.js'
+                path.write_text(script, encoding='utf-8')
+                checked = subprocess.run([node, '--check', str(path)], capture_output=True, text=True)
+                self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_fixed_entry_still_touches_when_reservation_changes_at_sale(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('Node.js is needed for offline AutoX mock')
+        profile = validate_profile(RAW_PROFILE)
+        script = build_fixed_coordinate_payment_script(profile, {
+            'width': 1080, 'height': 2376, 'gapMs': 5,
+            'entry': [600, 2150], 'tier': [300, 560], 'confirm': [860, 2150],
+        }).replace('var USER_PRESELECTED = false;', 'var USER_PRESELECTED = true;', 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'fixed-sale-transition.js'
+            path.write_text(script, encoding='utf-8')
+            harness = Path(__file__).with_name('autox_live_mock.js')
+            for scenario in ('fixed_reservation_switches', 'fixed_reservation_already_switched'):
+                with self.subTest(scenario=scenario):
+                    run = subprocess.run([node, str(harness), str(path), scenario],
+                                         capture_output=True, text=True, encoding='utf-8', errors='replace')
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    outcome = json.loads(run.stdout)
+                    self.assertGreaterEqual(len(outcome['shortPresses']), 1)
+                    self.assertEqual(outcome['clicks'][0], '立即购票')
+                    self.assertGreaterEqual(outcome['clickTimes'][0], 0)
+                    self.assertGreaterEqual(outcome['diagnosticWrites'][-1]['data']['entryTouchCount'], 1)
+
     def simulate(self, scenario, *, rehearsal=False, probe=False, payment=False, congestion_probe=False, wechat=False,
                  capture=False, amount=1380, source='workbench', initial_storage=None):
         node = shutil.which('node')
@@ -74,6 +122,22 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertEqual(len(failed['shortPresses']), 1)
         self.assertEqual(failed['clicks'], [])
         self.assertEqual(failed['state'], 'detail')
+
+    def test_entry_retries_only_when_same_detail_remains(self):
+        ignored = self.simulate('entry_first_touch_ignored')
+        self.assertEqual(ignored['clicks'], ['立即购票', '立即购票'])
+        self.assertEqual(len(ignored['shortPresses']), 2)
+        advanced = self.simulate('sku_already_target')
+        self.assertEqual(advanced['clicks'].count('立即购票'), 1)
+        self.assertEqual(len(advanced['shortPresses']), 2)
+
+    def test_guarded_preflight_accepts_presale_entry_but_never_touches_early(self):
+        switched = self.simulate('presale_reservation_switched', payment=True)
+        self.assertEqual(switched['clicks'], ['立即购票', '提交订单'])
+        self.assertGreaterEqual(switched['clickTimes'][0], 0)
+        missing = self.simulate('presale_reservation_missing_no_entry', payment=True)
+        self.assertEqual(missing['clicks'], [])
+        self.assertEqual(missing['lockFiles'], {})
 
     def test_short_touches_continue_all_four_merchant_pages_without_touching_wechat(self):
         outcome = self.simulate('wechat_payment_sheet_full_flow', wechat=True, amount=480)

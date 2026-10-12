@@ -7,7 +7,8 @@ from pathlib import Path
 from .autox_live_export import (REHEARSAL_OUTPUT, CONGESTION_PROBE_OUTPUT, CAPTURE_OUTPUT,
                                 build_selection_capture_script, build_wechat_script,
                                 build_congestion_probe_script,
-                                build_selection_rehearsal_script)
+                                build_selection_rehearsal_script,
+                                build_fixed_coordinate_payment_script)
 from .paths import DATA, ROOT
 
 
@@ -18,6 +19,17 @@ REHEARSAL_PHONE_OUTPUT = '/sdcard/Download/autox-maoyan-rehearsal.js'
 AUTOX_ACTIVITY = 'org.autojs.autoxjs.v7/org.autojs.autojs.external.open.OpenIntentActivity'
 BENCHMARK_SOURCE = ROOT / 'tools' / 'autox_first_click_benchmark.js'
 BENCHMARK_OUTPUT = DATA / 'autox-first-click-benchmark.js'
+FIXED_PATH_OUTPUT = DATA / 'autox-maoyan-fixed-path.js'
+
+
+def open_fixed_coordinate_payment_on_phone(profile: dict, coordinates: dict, *,
+                                           adb: Path = ADB, output: Path = FIXED_PATH_OUTPUT,
+                                           run=None) -> None:
+    """Open the separate one-shot fast path; never reuse the standard live file."""
+    _open_script_on_phone(profile, build_fixed_coordinate_payment_script(profile, coordinates),
+                          adb=adb, output=output,
+                          phone_output='/sdcard/Download/autox-maoyan-fixed-path.js',
+                          run=_run if run is None else run)
 
 
 def _run(args: list[str]) -> str:

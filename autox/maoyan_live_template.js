@@ -1,6 +1,7 @@
 // EXPERIMENTAL AutoX v7 Rhino prototype. Do not enable until the read-only
 // phone probe and real Maoyan sale/selection/order layouts have been checked.
-// No fixed coordinates, blind retries, or final payment actions.
+// The default flow uses guarded nodes. An explicit separate build can enable
+// a one-shot fixed-coordinate start, with order verification before submission.
 var TARGET = null;
 var ENABLE_EXPERIMENTAL_LIVE = false;
 var PRECHECK_ONLY = false;
@@ -11,6 +12,8 @@ var CONGESTION_PRECHECK_ONLY = false;
 var OPEN_WECHAT_PAYMENT = false;
 var USER_PRESELECTED = false;
 var CAPTURE_SELECTION_ONLY = false;
+var FAST_FIXED_PATH = false;
+var FAST_COORDS = null;
 
 (function () {
     if (!ENABLE_EXPERIMENTAL_LIVE) {
@@ -60,6 +63,8 @@ var CAPTURE_SELECTION_ONLY = false;
     var entryFoundEpochMs = null;
     var entryClickEpochMs = null;
     var entryClickCallMs = null;
+    var entryTouchCount = 0;
+    var lastEntryTouchEpochMs = null;
     var entryDecisionReadMs = null;
     var entryNextPageEpochMs = null;
     var congestionRefreshes = 0;
@@ -111,7 +116,10 @@ var CAPTURE_SELECTION_ONLY = false;
                     entryDiscoveryToClickMs: entryFoundEpochMs === null || entryClickEpochMs === null ? null :
                         entryClickEpochMs - entryFoundEpochMs,
                     entryClickCallMs: entryClickCallMs,
+                    entryTouchCount: entryTouchCount,
                     entryDecisionReadMs: entryDecisionReadMs,
+                    fastFixedPath: FAST_FIXED_PATH,
+                    configuredGapMs: FAST_FIXED_PATH && FAST_COORDS ? FAST_COORDS.gapMs : null,
                     entryClickToNextPageObservedMs: entryClickEpochMs === null || entryNextPageEpochMs === null ? null :
                         entryNextPageEpochMs - entryClickEpochMs,
                     congestionRefreshes: congestionRefreshes,
@@ -429,7 +437,11 @@ var CAPTURE_SELECTION_ONLY = false;
         var y = Math.floor((b.top + b.bottom) / 2);
         if (beforeClick) beforeClick();
         var clickStarted = Date.now();
-        if (stage === "购票入口") entryClickEpochMs = clickStarted;
+        if (stage === "购票入口") {
+            if (entryClickEpochMs === null) entryClickEpochMs = clickStarted;
+            lastEntryTouchEpochMs = clickStarted;
+            entryTouchCount++;
+        }
         // Reuse the short-touch dispatch for the guarded date, tier, confirm
         // and order actions too. Page readiness is still observed separately.
         var clicked = shortTouchOnce(x, y, stage);
@@ -445,8 +457,12 @@ var CAPTURE_SELECTION_ONLY = false;
         }
         var reservationPattern = /^\s*已\s*预\s*约\s*$/;
         if (requireReservation &&
-                matchingPattern(reservationPattern, true).length === 0) {
-            stop("目标详情页未显示已预约状态，已停止。");
+                matchingPattern(reservationPattern, true).length === 0 &&
+                entryNodes().length !== 1) {
+            // The purchase label may replace the reservation label just
+            // before the advertised sale second. This preflight validates
+            // that state; the timed loop still prevents an early touch.
+            stop("目标详情页既无预约状态也无唯一购票入口，已停止。");
         }
     }
     function priceNodes() {
@@ -1015,6 +1031,34 @@ var CAPTURE_SELECTION_ONLY = false;
         }
         stop("页面转换后未识别出选票或订单页，已停止。");
     }
+    function waitForKindAfterEntry(timeoutMs) {
+        var deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            var kind = pageKind();
+            if (kind !== "unknown") return kind;
+            // A second entry touch is allowed only when a fresh read still
+            // shows the exact same event, city and one enabled entry control.
+            // Never repeat over a loading, queue or verification overlay.
+            if (has(TARGET.titleToken) && has(TARGET.city) &&
+                    !hasAny(["加载中", "正在加载", "排队中", "正在跳转"])) {
+                var entries = entryNodes();
+                if (entries.length > 1) stop("购票入口出现多个候选，已停止。");
+                if (entries.length === 1 && entries[0].enabled() && entryTouchCount < 3) {
+                    var waitMs = lastEntryTouchEpochMs + 250 - Date.now();
+                    if (waitMs > 0) {
+                        pauseAfterRead(waitMs);
+                        continue; // Never click from a snapshot taken before the wait.
+                    }
+                    clickFresh("购票入口", entryNodes,
+                        function () { verifyDetail(false, true); });
+                    mark("同页重试购票入口");
+                    continue;
+                }
+            }
+            pauseAfterRead(80);
+        }
+        stop("入口点击后未识别到选票或订单页，已停止；请在手机核对。");
+    }
     function continueSkuFlow() {
         if (!targetDateAlreadySelected()) {
             clickFresh("目标日期", dateNodes, function () {
@@ -1197,6 +1241,62 @@ var CAPTURE_SELECTION_ONLY = false;
         storage.put(TARGET.attemptKey, { state: "started", at: Date.now() });
     }
 
+    function waitUntilEpoch(epochMs) {
+        while (Date.now() < epochMs) sleep(Math.min(20, epochMs - Date.now()));
+    }
+    function runFixedCoordinatePath() {
+        var path = FAST_COORDS;
+        if (!path || device.width !== path.width || device.height !== path.height ||
+                !path.entry || !path.tier || !path.confirm ||
+                !SUBMIT_TO_PAYMENT || !USER_PRESELECTED || !OPEN_WECHAT_PAYMENT) {
+            stop("固定坐标模式配置或手机尺寸不匹配，已停止。");
+        }
+        function touchConfigured(stage, point) {
+            var started = Date.now();
+            if (stage === "固定入口") {
+                entryClickEpochMs = started;
+                lastEntryTouchEpochMs = started;
+                entryTouchCount++;
+            }
+            if (!shortTouchOnce(point[0], point[1], stage)) {
+                stop(stage + "触摸结果不明确，已停止；不会重试。");
+            }
+            if (stage === "固定入口") entryClickCallMs = Date.now() - started;
+            mark(stage);
+        }
+        // The last identity read occurs before opening; sale-time touches do
+        // not fetch a full accessibility tree or retry a missed coordinate.
+        while (Date.now() < TARGET.saleEpochMs - 1000) {
+            sleep(Math.min(200, TARGET.saleEpochMs - 1000 - Date.now()));
+        }
+        checkPackage(true);
+        // The normal reservation label may already have become the purchase
+        // label just before sale. Identity must still match, but an early
+        // switch is not an error.
+        verifyDetail(false, true);
+        waitUntilEpoch(TARGET.saleEpochMs);
+        if (currentPackage() !== PACKAGE) stop("开售时猫眼不在前台，已停止。");
+        claimAttempt();
+        touchConfigured("固定入口", path.entry);
+        waitUntilEpoch(TARGET.saleEpochMs + path.gapMs);
+        touchConfigured("固定目标票档", path.tier);
+        waitUntilEpoch(TARGET.saleEpochMs + path.gapMs * 2);
+        touchConfigured("固定票档确认", path.confirm);
+
+        // An order is submitted only after the target date, amount, quantity
+        // and single attendee are confirmed by the existing order guards.
+        var deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+            if (pageKind() === "order") {
+                mark("固定路径到达订单页");
+                finishAtOrder();
+                return;
+            }
+            pauseAfterRead(40);
+        }
+        stop("固定点击后未确认进入目标订单页；不重试或提交，请在手机核对。");
+    }
+
     try {
         auto.waitFor();
         // The device reported a stale accessibility root in AutoX's cached
@@ -1284,6 +1384,17 @@ var CAPTURE_SELECTION_ONLY = false;
             stop("这场演出已有一次手机端选档尝试；请核对猫眼页面。");
         }
         loadFrozenTarget();
+        if (FAST_FIXED_PATH) {
+            // Maoyan can replace "已预约" with the purchase entry before the
+            // advertised sale second. Accept either state on this same event.
+            verifyDetail(false, true);
+            if (matchingPattern(/^\s*已\s*预\s*约\s*$/, true).length === 0 &&
+                    entryNodes().length !== 1) {
+                stop("目标详情页既无预约状态也无唯一购票入口，已停止。");
+            }
+            runFixedCoordinatePath();
+            return;
+        }
         if (preparedLayout()) {
             runPreparedStart();
             return;
@@ -1349,7 +1460,7 @@ var CAPTURE_SELECTION_ONLY = false;
             function () { if (!SELECTION_REHEARSAL) claimAttempt(); });
         mark("点击购票入口");
 
-        var kind = waitForKind(5000);
+        var kind = waitForKindAfterEntry(5000);
         entryNextPageEpochMs = Date.now();
         mark(kind === "sku" ? "识别选票页" : "识别订单页");
         if (kind === "order") {
