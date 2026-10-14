@@ -5,8 +5,17 @@ const vm = require('vm');
 const crypto = require('crypto');
 
 const script = fs.readFileSync(process.argv[2], 'utf8');
-const scenario = process.argv[3];
+const inputScenario = process.argv[3];
+const nativeOrderCase = inputScenario.startsWith('native_order_') ? inputScenario.slice(13) : null;
+const scenario = nativeOrderCase ? 'wechat_payment_sheet_full_flow' : inputScenario;
 const target = JSON.parse(script.match(/^var TARGET = (.+);$/m)[1]);
+const androidSkuScenario = scenario.startsWith('android_sku_');
+const nativeSkuScenario = scenario.startsWith('native_sku_');
+const numericZhangTitleScenario = scenario.startsWith('combined_order_numeric_zhang');
+const combinedOrderScenario = scenario === 'combined_order_summary' || numericZhangTitleScenario;
+const nativeActions = [];
+const androidSkuFixture = androidSkuScenario ? JSON.parse(fs.readFileSync(
+    require('path').join(__dirname, 'fixtures', 'maoyan_sku_split_total.json'), 'utf8')) : null;
 const maskedScenario = scenario.startsWith('wechat_masked_');
 const paymentSheetScenario = scenario.startsWith('wechat_payment_sheet') ||
     scenario === 'wechat_masked_selected_sheet' || scenario === 'payment_order_sheet';
@@ -30,6 +39,7 @@ let attendeeChecked = false;
 let attendeeCheckedAt = Infinity;
 let selectedSkuAt = Infinity;
 let orderReadyAt = Infinity;
+let entryReadyAt = Infinity;
 let rectAllocations = 0;
 let congestionVisible = scenario.startsWith('probe_congestion');
 let refreshCount = 0;
@@ -64,12 +74,42 @@ const detailReadStartedAfterSaleMs = [];
 const propertyReads = { className: 0, checkable: 0, checked: 0 };
 const geometryReads = {};
 const sleeps = [];
+let unrecycledNativeNodes = 0;
+let doubleNativeRecycles = 0;
 if (scenario === 'already_claimed') {
     lockFiles['/private/qiangpiao-maoyan-' + target.attemptKey.replace(/:/g, '-') + '.lock'] = true;
 }
 const dateToken = ['decimal_price_payment_label', 'sku', 'sold_out_sku'].includes(scenario) ? target.dateLabels[0] :
     target.dateLabels.find(label => label.indexOf('月') >= 0);
 const dateLabel = dateToken + ' 周六 19:00';
+
+function androidSkuTree() {
+    const selected = state === 'sku_selected';
+    const total = scenario === 'android_sku_wrong_total' ? target.amount + 100 :
+        scenario === 'android_sku_total_changed_before_confirm' && stateReads.sku_selected >= 2 ? target.amount + 100 :
+        scenario === 'android_sku_two_tickets' ? target.amount * 2 : target.amount;
+    function copy(raw) {
+        let label = raw.text.replace('$TITLE', target.titleToken).replace('$CITY', target.city)
+            .replace('$DATE', dateLabel).replace('$AMOUNT', String(target.amount)).replace('$TOTAL', String(total));
+        if (!selected && (label === '数量' || /限购/.test(label) || /^\d+张$/.test(label) ||
+                /^总计/.test(label) || label === String(total) || label === '明细' || label === '确认')) label = '';
+        if (scenario === 'android_sku_two_tickets' && label === '1张') label = '2张';
+        if (scenario === 'android_sku_substring_price' && raw.text === '¥$AMOUNT') label = '¥1580';
+        const b = raw.bounds;
+        const row = { text: label, desc: '', enabled: raw.enabled !== false, selected: false, checked: false,
+            checkable: false, bounds: {left: b[0], top: b[1], right: b[2], bottom: b[3]} };
+        if (raw.children) row.children = raw.children.map(copy);
+        return row;
+    }
+    return copy(androidSkuFixture.root);
+}
+
+function androidSkuRows() {
+    const output = [];
+    function walk(row) { output.push(row); (row.children || []).forEach(walk); }
+    walk(androidSkuTree());
+    return output;
+}
 
 function item(label, index) {
     const confirmation = label === '确认';
@@ -89,11 +129,11 @@ function item(label, index) {
             !(scenario === 'attendee_disabled' && label === '[观演人勾选框]') &&
             !(scenario === 'disabled_price' && label === '看台 ¥' + target.amount),
         selected: ((state === 'sku' || state === 'sku_selected') &&
-            label === dateLabel && scenario !== 'sku' &&
+            label === dateLabel && scenario !== 'sku' && !nativeSkuScenario &&
             (scenario !== 'date_transition' || dateClicked)) ||
             (state === 'sku_selected' && selectedSkuAt !== Infinity && scenario !== 'price_wrong_selection' &&
                 label === '看台 ¥' + target.amount) ||
-            (['sku_already_target', 'retained_tier_changed', 'retained_date_changed',
+            (['sku_already_target', 'sku_preselected_toggle_off', 'retained_tier_changed', 'retained_date_changed',
               'prepared_to_sku', 'prepared_to_sku_no_change'].includes(scenario) &&
                 label === '看台 ¥' + target.amount), bounds: {
         left: label === '刷新' && congestionVisible ? 500 : confirmation ? 640 + index * 10 : 20 + index * 2,
@@ -105,6 +145,7 @@ function item(label, index) {
     }};
 }
 function rows() {
+    if (androidSkuScenario && ['sku', 'sku_selected'].includes(state)) return androidSkuRows();
     if (state === 'prepared') {
         const labels = [target.titleToken, target.city, '场次', '票档', dateLabel,
             '看台 ¥' + target.amount, scenario === 'prepared_two_tickets' ? '2张' : '1张',
@@ -150,10 +191,15 @@ function rows() {
                 '看台 ¥' + target.amount,
             '请选择票档'];
         if (scenario === 'duplicate_price_sku') labels.push('看台 ¥' + target.amount);
+        if (['native_sku_double_label_card', 'native_sku_double_wrong_kind'].includes(scenario)) {
+            if (scenario === 'native_sku_double_wrong_kind') labels[2] = '内场' + target.amount + '元';
+            labels.push('¥' + target.amount);
+        }
+        if (scenario === 'sku' || nativeSkuScenario || scenario === 'date_transition' && !dateClicked) labels.push('2026-12-06 周日 19:00');
         if (scenario === 'sold_out_sibling') labels.push('缺货登记');
         return labels.map(item);
     }
-    if (state === 'sku_selected') {
+    if (state === 'sku_selected' || state === 'order_pending_sku') {
         if (scenario === 'tier_long_delay' && now < selectedSkuAt + 1200) {
             return ['选择票档', dateLabel, '看台 ¥' + target.amount, '请选择票档'].map(item);
         }
@@ -161,11 +207,13 @@ function rows() {
             '看台 ¥' + target.amount,
             scenario === 'wrong_quantity_after_price' ? '2张' : '1张', '确认'];
         if (scenario === 'quantity_long_delay' && now < selectedSkuAt + 1200) labels.splice(3, 1);
+        if (scenario === 'quantity_short_delay' && now < selectedSkuAt + 96) labels.splice(3, 1);
         if (scenario === 'ambiguous_confirm') labels.push('确认');
         return labels.map(item);
     }
     if (state === 'order' || state === 'payment_sheet') {
-        const price = scenario === 'combined_order_summary' ? '看台 ￥' + target.amount + ' ×1张' :
+        const price = combinedOrderScenario ? '看台 ￥' + target.amount +
+            (scenario.endsWith('_two_tickets') ? ' ×2张' : ' ×1张') :
             scenario === 'decimal_price_payment_label' ?
             '¥' + target.amount + '.00' : '¥' +
             (scenario === 'wrong_order_price' ? target.amount + 100 :
@@ -176,16 +224,18 @@ function rows() {
                 scenario === 'wechat_masked_all_stars' ? '*****' :
                     scenario === 'wechat_masked_fullwidth' ? '测＊＊＊人' : '测***人' :
             scenario === 'wrong_attendee' ? '另一个人' : '测试观演人';
-        const labels = [target.titleToken, target.city,
+        const orderTitle = numericZhangTitleScenario ? '2\u200b0\u200b2\u200b6张智霖 “在” ' + target.titleToken :
+            scenario === 'native_sku_zero_width_order' ? target.titleToken.split('').join('\u200b') : target.titleToken;
+        const labels = [orderTitle, target.city,
             scenario === 'wrong_order_date' ? '2026-12-06 周日 19:00' : dateLabel,
             price, '实名观演人', attendeeName];
-        const immediateReview = ['instant_pay_order', 'combined_order_summary', 'wechat_immediate_review'].includes(scenario) ||
+        const immediateReview = combinedOrderScenario || ['instant_pay_order', 'wechat_immediate_review'].includes(scenario) ||
             maskedScenario || paymentSheetScenario && scenario !== 'payment_order_sheet';
         if (immediateReview) labels.unshift('\u786e\u8ba4\u8d2d\u7968');
         if (scenario === 'wechat_masked_ambiguous') labels.push('测***人');
         if (scenario !== 'attendee_missing') labels.push('[观演人勾选框]');
         if (scenario === 'attendee_ambiguous' || scenario === 'wechat_masked_ambiguous_checkbox') labels.push('[观演人勾选框]');
-        if (scenario !== 'combined_order_summary') labels.push(scenario === 'two_ticket_order' ? '2张' :
+        if (!combinedOrderScenario) labels.push(scenario === 'two_ticket_order' ? '2张' :
             scenario === 'eleven_ticket_order' ? '11张' : '1张');
         labels.push('取票方式',
             immediateReview ? '立即支付' : '提交订单');
@@ -301,26 +351,40 @@ function clickRow(row) {
     } else if (state === 'detail' && row.text === '立即购票') {
         if (scenario === 'entry_first_touch_ignored' &&
                 clicks.filter(label => label === '立即购票').length === 1) return true;
-        state = ['sku_already_chosen', 'sku_already_target', 'retained_tier_changed', 'retained_date_changed'].includes(scenario) ? 'sku_selected' :
+        state = ['sku_already_chosen', 'sku_already_target', 'sku_preselected_toggle_off', 'retained_tier_changed', 'retained_date_changed'].includes(scenario) ? 'sku_selected' :
             ['sku', 'sku_preselected', 'sold_out_sku', 'price_click_no_change',
              'duplicate_price_sku', 'wrong_quantity_after_price',
              'ambiguous_confirm', 'confirm_click_no_change',
              'disabled_confirm', 'price_auto_order', 'sold_out_sibling', 'disabled_price',
              'challenge_before_price', 'challenge_before_confirm', 'date_transition', 'tier_long_delay',
-             'quantity_long_delay', 'confirm_long_delay', 'order_long_delay'].includes(scenario) ? 'sku' :
+             'quantity_long_delay', 'quantity_short_delay', 'confirm_long_delay', 'order_long_delay',
+             'order_still_shows_sku'].includes(scenario) ? 'sku' :
             scenario === 'unknown_after_entry' ? 'unknown' : 'order';
         if (scenario === 'challenge_after_entry') state = 'challenge';
         if (scenario.startsWith('phone_') || scenario === 'price_wrong_selection' || fullFastFlowScenario) state = 'sku';
+        if (nativeSkuScenario) state = 'sku';
+        if (scenario.startsWith('transition_entry_')) {
+            state = 'entry_loading';
+            if (scenario === 'transition_entry_timed') entryReadyAt = now + 96;
+        }
+        if (androidSkuScenario) state = ['android_sku_unselected_no_prompt', 'android_sku_substring_price'].includes(scenario) ? 'sku' : 'sku_selected';
         if (scenario.startsWith('congestion_') && scenario !== 'congestion_after_submit') congestionVisible = true;
+    } else if (state === 'sku_selected' && scenario === 'sku_preselected_toggle_off' && row.text === '看台 ¥' + target.amount) {
+        state = 'sku';
+        selectedSkuAt = Infinity;
     } else if (state === 'sku' && row.text === dateLabel && scenario === 'date_transition') {
         dateClicked = true;
         state = 'date_loading';
+    } else if (androidSkuScenario && ['sku', 'sku_selected'].includes(state) && row.text === '¥' + target.amount) {
+        selectedSkuAt = now;
+        state = 'sku_selected';
     } else if (state === 'sku' && row.text === '看台 ¥' + target.amount) {
         selectedSkuAt = now;
         if (scenario === 'price_auto_order') state = 'order';
         else if (scenario !== 'price_click_no_change') state = 'sku_selected';
     } else if (state === 'sku_selected' && row.text === '确认') {
         if (scenario === 'order_long_delay') { state = 'order_loading'; orderReadyAt = now + 5000; }
+        else if (scenario === 'order_still_shows_sku') { state = 'order_pending_sku'; orderReadyAt = now + 96; }
         else if (!['confirm_click_no_change', 'prepared_to_sku_no_change'].includes(scenario)) state = 'order';
     } else if (state === 'order' && row.checkable) {
         if (['attendee_delayed', 'attendee_long_delay'].includes(scenario)) attendeeCheckedAt = now +
@@ -374,14 +438,26 @@ function selector(kind, value) {
 }
 function nativeRow(row, children) {
     children = children || [];
-    return {
+    unrecycledNativeNodes++;
+    let recycled = false;
+    const result = {
+        __children: children,
+        __row: row,
         getPackageName: () => state === 'wechat' ? 'com.tencent.mm' : scenario === 'wrong_package' ||
             scenario === 'external_after_submit' && state === 'payment' ||
             scenario === 'package_changed_after_entry' && state !== 'detail' ? 'other.app' : target.package,
-        getText: () => row.text,
+        getText: () => {
+            if (scenario === 'transition_entry_label_error' && state === 'sku' && row.text === dateLabel) {
+                throw new Error('Private label must not escape');
+            }
+            return row.text;
+        },
         getContentDescription: () => row.desc || '',
         getClassName: () => { propertyReads.className++; return row.className || 'android.view.View'; },
         getBoundsInScreen: rect => {
+            if (scenario === 'transition_entry_geometry_error' && state === 'sku' && row.text === dateLabel) {
+                throw new Error('Private geometry must not escape');
+            }
             if (congestionVisible && row.text !== '刷新') congestionNonRefreshGeometryReads++;
             if (congestionVisible && row.text && row.text !== '刷新' &&
                     !/前方拥堵|请刷新重试/.test(row.text)) congestionUnderlyingGeometryReads++;
@@ -393,20 +469,39 @@ function nativeRow(row, children) {
             (row.text === '[观演人勾选框]' && (attendeeChecked || now >= attendeeCheckedAt) || row.checked); },
         isCheckable: () => { propertyReads.checkable++; return !!row.checkable; },
         isSelected: () => !!row.selected,
+        isClickable: () => row.clickable === true || row.clickable !== false && !!row.text,
+        getParent: () => result.__parent || null,
+        performAction: () => {
+            const clickTarget = row.clickTarget || row;
+            nativeActions.push(clickTarget.text);
+            if (scenario === 'native_sku_rejected_tier' && clickTarget.text === '看台 ¥' + target.amount) return false;
+            return clickRow(clickTarget);
+        },
         getChildCount: () => children.length,
         getChild: index => children[index],
-        recycle: () => {}
+        recycle: () => {
+            if (recycled) doubleNativeRecycles++;
+            else { recycled = true; unrecycledNativeNodes--; }
+        }
     };
+    children.forEach(child => { child.__parent = result; });
+    return result;
 }
 function nativeRoot() {
     treeReads++;
+    if (state === 'entry_loading' && scenario === 'transition_entry_timed') now += 5;
+    if (state === 'entry_loading' && scenario === 'transition_entry_slow') now += 75;
     if (state === 'detail') detailReadStartedAfterSaleMs.push(now - target.saleEpochMs);
     if (['slow_entry', 'slow_countdown', 'slow_countdown_challenge'].includes(scenario)) now += 120;
     if (state === 'detail' && now >= target.saleEpochMs) onSaleDetailReads++;
     if (scenario === 'slow_attendee_no_change' && state === 'order') now += 120;
     stateReads[state] = (stateReads[state] || 0) + 1;
     if (state === 'date_loading' && stateReads.date_loading >= 3) state = 'sku';
+    if (state === 'entry_loading' && (scenario === 'transition_entry_timed' ?
+            now >= entryReadyAt : stateReads.entry_loading >= 3)) state = 'sku';
     if (state === 'order_loading' && now >= orderReadyAt) state = 'order';
+    if (state === 'order_pending_sku' && now >= orderReadyAt) state = 'order';
+    if (scenario === 'transition_entry_challenge' && state === 'sku' && stateReads.sku >= 1) state = 'challenge';
     if (scenario === 'congestion_disappears' && refreshCount >= 1) congestionVisible = false;
     // Introduce a verification overlay specifically at the fresh pre-click read.
     if (scenario === 'challenge_before_price' && state === 'sku' && stateReads.sku === 2 ||
@@ -416,6 +511,26 @@ function nativeRoot() {
     if (scenario === 'broken_native_tree') throw new Error('Private screen text must never be printed');
     if (scenario === 'challenge_before_submit' && state === 'order' && stateReads.order >= 3) state = 'challenge';
     const records = rows();
+    if (nativeOrderCase && state === 'order' && stateReads.order >= 2) {
+        if (nativeOrderCase === 'challenge') records.push(item('人机验证', records.length));
+        if (nativeOrderCase === 'autopay') records.push(item('免密支付', records.length));
+        if (nativeOrderCase === 'wrong_price') records.forEach(row => {
+            if (row.text === '¥' + target.amount) row.text = '¥' + (target.amount + 100);
+        });
+        if (nativeOrderCase === 'attendee_changed') records.forEach(row => {
+            if (row.checkable) row.checked = false;
+        });
+        if (nativeOrderCase === 'disabled_submit') records.forEach(row => {
+            if (row.text === '立即支付') row.enabled = false;
+        });
+    }
+    if (scenario === 'transition_entry_changed_date' && state === 'sku' && stateReads.sku >= 1) {
+        records.forEach(row => { if (row.text === dateLabel) row.text = '2026-12-06 周日 19:00'; });
+    }
+    if (androidSkuScenario && ['sku', 'sku_selected'].includes(state)) {
+        function build(row) { return nativeRow(row, (row.children || []).map(build)); }
+        return build(androidSkuTree());
+    }
     if (['retained_tier_changed', 'retained_date_changed'].includes(scenario) &&
             state === 'sku_selected' && stateReads.sku_selected >= 2) {
         records.forEach(row => {
@@ -456,6 +571,20 @@ function nativeRoot() {
             children.push(nativeRow({text: '', enabled: true,
                 bounds: {left: 10, top: 500, right: 700, bottom: 770}},
                 [nativeRow(row), nativeRow(records.find(record => record.text === '缺货登记'))]));
+        } else if (['native_sku_double_label_card', 'native_sku_double_wrong_kind'].includes(scenario) &&
+                state === 'sku' && ['看台 ¥' + target.amount, '内场' + target.amount + '元', '¥' + target.amount].includes(row.text)) {
+            if (row.text !== '¥' + target.amount) {
+                const amountRow = records.find(record => record.text === '¥' + target.amount);
+                const bounds = {left:Math.min(row.bounds.left,amountRow.bounds.left),
+                    top:Math.min(row.bounds.top,amountRow.bounds.top),
+                    right:Math.max(row.bounds.right,amountRow.bounds.right),
+                    bottom:Math.max(row.bounds.bottom,amountRow.bounds.bottom)};
+                children.push(nativeRow({text:'',enabled:true,clickable:true,clickTarget:row,bounds},
+                    [nativeRow({...row,clickable:false}),nativeRow({...amountRow,clickable:false})]));
+            }
+        } else if (scenario === 'native_sku_child_label' && [dateLabel, '看台 ¥' + target.amount, '确认'].includes(row.text)) {
+            children.push(nativeRow({text:'', enabled:true, clickable:true, clickTarget:row, bounds:row.bounds},
+                [nativeRow({...row, clickable:false})]));
         } else children.push(nativeRow(row));
     }
     if (wechatMethodChildren.length) {
@@ -481,26 +610,44 @@ function nativeRoot() {
             }
         }
     }
-    return nativeRow({text: '', enabled: true,
+    const root = nativeRow({text: '', enabled: true,
         bounds: {left: 0, top: 0, right: 1080, bottom: 2400}}, children);
+    if (nativeSkuScenario) root.findAccessibilityNodeInfosByText = label => {
+        const found = [], stack = [root];
+        while (stack.length) {
+            const current = stack.pop();
+            if (String(current.getText()).includes(label)) found.push(current);
+            stack.push(...current.__children);
+        }
+        if (scenario === 'native_sku_duplicate_lookup' && label === '看台 ¥' + target.amount) found.push(found[0]);
+        return {size: () => found.length, get: index => found[index]};
+    };
+    if (nativeOrderCase && state === 'order') root.findAccessibilityNodeInfosByText = label => {
+        if (nativeOrderCase === 'marker_throw') throw new Error('Native query unavailable');
+        const copies = records.filter(row => nativeOrderCase !== 'marker_missing' &&
+            (row.text.includes(label) || String(row.desc || '').includes(label))).map(row => nativeRow({...row}));
+        return {size: () => copies.length, get: index => copies[index]};
+    };
+    return root;
 }
 const context = {
     RegExp: function (pattern, flags) { regexCompilations++; return new RegExp(pattern, flags); },
     auto: { waitFor: () => {}, setMode: () => {}, service: {
         getRootInActiveWindow: nativeRoot
     } },
-    android: { graphics: { Rect: function () { rectAllocations++; } }, util: { Log: { i: () => {} } } },
+    android: { graphics: { Rect: function () { rectAllocations++; } }, util: { Log: { i: () => {} } },
+        view: {accessibility: {AccessibilityNodeInfo: {ACTION_CLICK: 16}}} },
     toast: () => {},
     files: { write: (path, body) => diagnosticWrites.push({path, data: JSON.parse(body)}) },
     click: (x, y) => {
-        const match = rows().find(row => x >= row.bounds.left &&
+        const match = rows().filter(row => !androidSkuScenario || row.text).find(row => x >= row.bounds.left &&
             x <= row.bounds.right && y >= row.bounds.top &&
             y <= row.bounds.bottom);
         return match ? clickRow(match) : false;
     },
     sleep: ms => { sleeps.push(ms); now += ms; },
     Date: { now: () => now },
-    device: { width: 1080, height: scenario.startsWith('fixed_reservation_') ? 2376 : 2400 },
+    device: { width: 1080, height: scenario.startsWith('fixed_reservation_') || androidSkuScenario ? 2376 : 2400 },
     currentPackage: () => scenario === 'stale_current_package' ? 'com.android.launcher' : target.package,
     text: value => selector('text', value),
     desc: value => selector('desc', value),
@@ -547,5 +694,5 @@ context.press = (x, y, duration) => {
 };
 if (scenario === 'wechat_payment_sheet_full_flow_no_press') delete context.press;
 vm.runInNewContext(script, context, { timeout: 2000 });
-process.stdout.write(JSON.stringify({ shortPresses, clicks, clickTimes, onSaleDetailReads, logs, stored, lockFiles, state, treeReads, selectorReads, diagnosticWrites, propertyReads, geometryReads, stateReads, detailReadStartedAfterSaleMs, sleeps, rectAllocations, congestionNonRefreshGeometryReads, congestionUnderlyingGeometryReads, hashComputations, regexCompilations }));
+process.stdout.write(JSON.stringify({ nativeActions, shortPresses, clicks, clickTimes, onSaleDetailReads, logs, stored, lockFiles, state, treeReads, selectorReads, diagnosticWrites, propertyReads, geometryReads, stateReads, detailReadStartedAfterSaleMs, sleeps, rectAllocations, congestionNonRefreshGeometryReads, congestionUnderlyingGeometryReads, hashComputations, regexCompilations, unrecycledNativeNodes, doubleNativeRecycles }));
 

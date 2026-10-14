@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 
 from ticketdesk.autox_live_export import (build_flow_probe_script, build_live_script, build_locked_prototype,
-                                          build_selection_rehearsal_script, build_payment_script, build_congestion_probe_script, build_wechat_script,
-                                          build_selection_capture_script, build_fixed_coordinate_payment_script)
+                                          build_selection_rehearsal_script, build_selection_confirmation_rehearsal_script, build_payment_script, build_congestion_probe_script, build_wechat_script,
+                                          build_selection_capture_script, build_fixed_coordinate_payment_script, build_merchant_payment_script)
 from ticketdesk.autox_phone import (open_live_on_phone, open_rehearsal_on_phone,
                                     open_first_click_benchmark_on_phone)
 from ticketdesk.profiles import validate_profile
@@ -79,12 +79,16 @@ class AutoXLiveExportTests(unittest.TestCase):
                     self.assertGreaterEqual(outcome['clickTimes'][0], 0)
                     self.assertGreaterEqual(outcome['diagnosticWrites'][-1]['data']['entryTouchCount'], 1)
 
-    def simulate(self, scenario, *, rehearsal=False, probe=False, payment=False, congestion_probe=False, wechat=False,
-                 capture=False, amount=1380, source='workbench', initial_storage=None):
+    def simulate(self, scenario, *, rehearsal=False, confirm_rehearsal=False, merchant_payment=False, probe=False, payment=False, congestion_probe=False, wechat=False,
+                 capture=False, amount=1380, source='workbench', initial_storage=None, template=None):
         node = shutil.which('node')
         if not node:
             self.skipTest('Node.js is needed for offline AutoX mock')
         builder = build_selection_rehearsal_script if rehearsal else build_live_script
+        if confirm_rehearsal:
+            builder = build_selection_confirmation_rehearsal_script
+        if merchant_payment:
+            builder = build_merchant_payment_script
         if probe:
             builder = build_flow_probe_script
         if payment:
@@ -96,7 +100,7 @@ class AutoXLiveExportTests(unittest.TestCase):
         if capture:
             builder = build_selection_capture_script
         raw = {**RAW_PROFILE, 'price': f'看台 {amount} 元', 'selection_source': source}
-        script = builder(validate_profile(raw))
+        script = builder(validate_profile(raw), template=template)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'synthetic-only.js'
             path.write_text(script, encoding='utf-8')
@@ -115,7 +119,7 @@ class AutoXLiveExportTests(unittest.TestCase):
     def test_entry_short_press_stops_before_wechat_and_never_retries_failure(self):
         outcome = self.simulate('wechat_direct', wechat=True)
         self.assertEqual(outcome['shortPresses'][0], {'duration': 1, 'state': 'detail'})
-        self.assertTrue(all(item['duration'] == 1 and item['state'] != 'wechat'
+        self.assertTrue(all(item['duration'] in (1, 20) and item['state'] != 'wechat'
                             for item in outcome['shortPresses']))
         self.assertEqual(outcome['state'], 'wechat')
         failed = self.simulate('entry_press_failed', wechat=True)
@@ -129,7 +133,7 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertEqual(len(ignored['shortPresses']), 2)
         advanced = self.simulate('sku_already_target')
         self.assertEqual(advanced['clicks'].count('立即购票'), 1)
-        self.assertEqual(len(advanced['shortPresses']), 2)
+        self.assertEqual(sum(touch['state'] == 'detail' for touch in advanced['shortPresses']), 1)
 
     def test_guarded_preflight_accepts_presale_entry_but_never_touches_early(self):
         switched = self.simulate('presale_reservation_switched', payment=True)
@@ -144,17 +148,18 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥480', '确认', '立即支付', '确认支付'])
         self.assertEqual(outcome['state'], 'wechat')
         self.assertEqual(len(outcome['shortPresses']), len(outcome['clicks']))
-        self.assertTrue(all(item['duration'] == 1 and item['state'] != 'wechat'
+        self.assertTrue(all(item['duration'] in (1, 20) and item['state'] != 'wechat'
                             for item in outcome['shortPresses']))
         record = outcome['diagnosticWrites'][-1]['data']
         self.assertEqual(record['state'], 'wechat_payment_page')
         self.assertEqual(len(record['touchTimings']), len(outcome['clicks']))
-        self.assertTrue(all(item['pressDurationMs'] == 1 for item in record['touchTimings']))
+        self.assertTrue(all(item['pressDurationMs'] == (1 if item['stage'] == '购票入口' else 20)
+                            for item in record['touchTimings']))
         self.assertFalse(record['automaticPayment'])
         unselected_date = self.simulate('sku', payment=True, amount=480)
         self.assertEqual(unselected_date['clicks'], ['立即购票', '2026-12-05 周六 19:00',
                                                    '看台 ¥480', '确认', '提交订单'])
-        self.assertTrue(all(item['duration'] == 1 for item in unselected_date['shortPresses']))
+        self.assertTrue(all(item['duration'] in (1, 20) for item in unselected_date['shortPresses']))
 
     def test_failed_short_confirmation_does_not_fall_back_or_submit(self):
         outcome = self.simulate('wechat_payment_sheet_full_flow_failed_confirm', wechat=True)
@@ -387,6 +392,169 @@ class AutoXLiveExportTests(unittest.TestCase):
                 self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认', '提交订单'])
                 self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'payment_page')
 
+    def test_order_loading_polls_skip_geometry_without_skipping_submit_checks(self):
+        outcome = self.simulate('order_long_delay', payment=True)
+        self.assertGreater(outcome['stateReads']['order_loading'], 10)
+        self.assertEqual(outcome['geometryReads'].get('order_loading', 0), 0)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认', '提交订单'])
+        self.assertGreater(outcome['propertyReads']['checkable'], 0)
+        reads = outcome['diagnosticWrites'][-1]['data']['readTimings']
+        self.assertTrue(any(read['mode'] is True for read in reads))
+        self.assertLessEqual(len(reads), 120)
+        self.assertTrue(all(set(read) == {'startedAfterOriginMs', 'elapsedMs', 'mode', 'nodes', 'phase',
+                                         'rootReadMs', 'nativeProbeMs', 'treeCopyMs'} for read in reads))
+        self.assertTrue(all(read['rootReadMs'] + read['nativeProbeMs'] + read['treeCopyMs'] ==
+                            read['elapsedMs'] for read in reads))
+
+    def test_native_order_reader_reuses_first_complete_order_but_keeps_fresh_submit_read(self):
+        baseline = (Path(__file__).resolve().parents[1] / 'autox/versions' /
+                    'maoyan_live_before_order_compact_20261014.js').read_text(encoding='utf-8')
+        old = self.simulate('native_order_regular', merchant_payment=True, template=baseline)
+        new = self.simulate('native_order_regular', merchant_payment=True)
+        self.assertEqual(new['clicks'], ['立即购票', '看台 ¥1380', '确认', '立即支付'])
+        self.assertEqual(new['clicks'], old['clicks'])
+        self.assertEqual(new['stateReads']['order'], old['stateReads']['order'] - 1)
+        self.assertEqual(new['stateReads']['order'], 2)
+        self.assertEqual(new['diagnosticWrites'][-1]['data']['state'], 'pending_payment_sheet')
+        self.assertEqual(new['unrecycledNativeNodes'], 0)
+        self.assertEqual(new['doubleNativeRecycles'], 0)
+        order_reads = [r for r in new['diagnosticWrites'][-1]['data']['readTimings'] if r['mode'] == 'order']
+        self.assertEqual(len(order_reads), 2)
+
+    def test_native_order_reader_revalidates_changes_before_submission(self):
+        for change in ['challenge', 'autopay', 'wrong_price', 'attendee_changed', 'disabled_submit']:
+            with self.subTest(change=change):
+                outcome = self.simulate('native_order_' + change, merchant_payment=True)
+                self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+                self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'not_submitted')
+                self.assertEqual(outcome['unrecycledNativeNodes'], 0)
+                self.assertEqual(outcome['doubleNativeRecycles'], 0)
+
+    def test_native_order_marker_failure_falls_back_without_losing_order_fields(self):
+        for case in ['marker_throw', 'marker_missing']:
+            with self.subTest(case=case):
+                outcome = self.simulate('native_order_' + case, merchant_payment=True)
+                self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认', '立即支付'])
+                self.assertEqual(outcome['stateReads']['order'], 3)
+                self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'pending_payment_sheet')
+                self.assertEqual(outcome['unrecycledNativeNodes'], 0)
+                self.assertEqual(outcome['doubleNativeRecycles'], 0)
+
+    def test_entry_loading_uses_light_reads_then_fresh_full_selection(self):
+        outcome = self.simulate('transition_entry_regular', confirm_rehearsal=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+        self.assertGreaterEqual(outcome['stateReads']['entry_loading'], 3)
+        self.assertEqual(outcome['geometryReads'].get('entry_loading', 0), 0)
+        reads = outcome['diagnosticWrites'][-1]['data']['readTimings']
+        self.assertTrue(any(read['mode'] == 'entry' for read in reads))
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'order_review_reached')
+
+    def test_entry_sampling_is_twenty_ms_and_completes_sku_without_second_root(self):
+        previous = (Path(__file__).resolve().parents[1] / 'autox' / 'versions' /
+                    'maoyan_live_before_entry_poll_20261014.js').read_text(encoding='utf-8')
+        old = self.simulate('transition_entry_timed', confirm_rehearsal=True, template=previous)
+        new = self.simulate('transition_entry_timed', confirm_rehearsal=True)
+        self.assertEqual(new['clicks'], old['clicks'])
+        old_record = old['diagnosticWrites'][-1]['data']
+        new_record = new['diagnosticWrites'][-1]['data']
+        # Same fake page becomes ready at +96 ms; each loading read costs 5 ms.
+        # This proves scheduling and root count, not a real-phone speed claim.
+        self.assertEqual(old_record['entryClickToNextPageObservedMs'], 165)
+        self.assertEqual(new_record['entryClickToNextPageObservedMs'], 105)
+        self.assertEqual(new['stateReads']['sku'], old['stateReads']['sku'] - 1)
+        self.assertEqual(new['geometryReads'].get('entry_loading', 0), 0)
+        self.assertTrue(all(ms == 15 for ms in new['sleeps'][1:]))
+
+    def test_entry_slow_reads_yield_without_adding_full_polling_interval(self):
+        outcome = self.simulate('transition_entry_slow', confirm_rehearsal=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+        self.assertEqual(outcome['sleeps'], [20000, 2, 2])
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'order_review_reached')
+
+    def test_ready_entry_sku_does_not_gain_a_new_tree_read(self):
+        previous = (Path(__file__).resolve().parents[1] / 'autox' / 'versions' /
+                    'maoyan_live_before_entry_poll_20261014.js').read_text(encoding='utf-8')
+        old = self.simulate('sku_preselected', confirm_rehearsal=True, template=previous)
+        new = self.simulate('sku_preselected', confirm_rehearsal=True)
+        self.assertEqual(new['clicks'], old['clicks'])
+        self.assertEqual(new['treeReads'], old['treeReads'])
+
+    def test_entry_deferred_nodes_release_on_success_and_copy_failure(self):
+        for scenario in ('transition_entry_regular', 'transition_entry_label_error',
+                         'transition_entry_geometry_error'):
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, confirm_rehearsal=True)
+                self.assertEqual(outcome['unrecycledNativeNodes'], 0)
+                self.assertEqual(outcome['doubleNativeRecycles'], 0)
+                if scenario != 'transition_entry_regular':
+                    self.assertEqual(outcome['clicks'], ['立即购票'])
+                    self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'not_submitted')
+                    self.assertNotIn('Private', str(outcome['logs']))
+
+    def test_selection_readiness_samples_twenty_ms_but_does_not_confirm_early(self):
+        previous = (Path(__file__).resolve().parents[1] / 'autox' / 'versions' /
+                    'maoyan_live_before_readiness_timing_20261014.js').read_text(encoding='utf-8')
+        old = self.simulate('quantity_short_delay', merchant_payment=True, template=previous)
+        new = self.simulate('quantity_short_delay', merchant_payment=True)
+        self.assertEqual(new['clicks'], old['clicks'])
+        price_index = new['clicks'].index('看台 ¥1380')
+        confirm_index = new['clicks'].index('确认')
+        new_delay = new['clickTimes'][confirm_index] - new['clickTimes'][price_index]
+        old_delay = old['clickTimes'][confirm_index] - old['clickTimes'][price_index]
+        self.assertEqual(new_delay, 100)
+        self.assertEqual(old_delay, 160)
+        self.assertGreaterEqual(new_delay, 96)
+        self.assertEqual(new['clicks'].count('确认'), 1)
+        timings = new['diagnosticWrites'][-1]['data']['transitionTimings']
+        selected = next(row for row in timings if row['stage'] == '票档控件就绪')
+        self.assertEqual(selected['firstReadyObservedAfterOriginMs'] - selected['actionStartedAfterOriginMs'], 100)
+        self.assertEqual(selected['readyToNextActionMs'], 0)
+        self.assertEqual(selected['lastUnavailableObservedAfterOriginMs'] - selected['actionStartedAfterOriginMs'], 80)
+
+    def test_transition_timings_are_observations_without_extra_queries_or_private_text(self):
+        previous = (Path(__file__).resolve().parents[1] / 'autox' / 'versions' /
+                    'maoyan_live_before_readiness_timing_20261014.js').read_text(encoding='utf-8')
+        old = self.simulate('wechat_payment_sheet_full_flow', merchant_payment=True, template=previous)
+        new = self.simulate('wechat_payment_sheet_full_flow', merchant_payment=True)
+        self.assertEqual(new['clicks'], old['clicks'])
+        self.assertEqual(new['treeReads'], old['treeReads'])
+        record = new['diagnosticWrites'][-1]['data']
+        self.assertEqual(record['state'], 'pending_payment_sheet')
+        timings = record['transitionTimings']
+        self.assertEqual([row['stage'] for row in timings],
+                         ['入口后页面', '票档控件就绪', '确认后订单页面', '提交后支付页面'])
+        for row in timings:
+            self.assertTrue(row['completed'])
+            self.assertGreater(row['readCount'], 0)
+            self.assertGreaterEqual(row['firstReadyReadStartedAfterOriginMs'], row['actionStartedAfterOriginMs'])
+            self.assertGreaterEqual(row['firstReadyObservedAfterOriginMs'], row['firstReadyReadStartedAfterOriginMs'])
+            self.assertGreaterEqual(row['finishedAfterOriginMs'], row['firstReadyObservedAfterOriginMs'])
+            self.assertNotIn('readBaseCount', row)
+        self.assertNotIn('测试观演人', str(timings))
+        self.assertNotIn(RAW_PROFILE['title'], str(timings))
+        self.assertNotIn('loadingMs', str(timings))
+        self.assertNotIn('确认支付', new['clicks'])
+
+    def test_order_wait_does_not_complete_geometry_of_the_old_sku(self):
+        previous = (Path(__file__).resolve().parents[1] / 'autox' / 'versions' /
+                    'maoyan_live_before_readiness_timing_20261014.js').read_text(encoding='utf-8')
+        old = self.simulate('order_still_shows_sku', merchant_payment=True, template=previous)
+        new = self.simulate('order_still_shows_sku', merchant_payment=True)
+        self.assertEqual(new['clicks'], old['clicks'])
+        self.assertEqual(new['clickTimes'], old['clickTimes'])
+        self.assertGreater(old['geometryReads'].get('order_pending_sku', 0), 0)
+        self.assertEqual(new['geometryReads'].get('order_pending_sku', 0), 0)
+        self.assertGreater(new['propertyReads']['checked'], 0)
+        self.assertEqual(new['diagnosticWrites'][-1]['data']['state'], 'payment_page')
+        self.assertEqual(new['clicks'].count('提交订单'), 1)
+
+    def test_light_match_cannot_act_when_fresh_selection_changes_or_gets_verification(self):
+        for scenario in ('transition_entry_changed_date', 'transition_entry_challenge'):
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, payment=True)
+                self.assertEqual(outcome['clicks'], ['立即购票'])
+                self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'not_submitted')
+
     def test_attendee_update_over_old_timeout_is_observed_without_reclick(self):
         outcome = self.simulate('attendee_long_delay', payment=True)
         self.assertEqual(outcome['clicks'], ['立即购票', '[观演人勾选框]', '提交订单'])
@@ -394,16 +562,18 @@ class AutoXLiveExportTests(unittest.TestCase):
 
     def test_rect_reuse_preserves_click_coordinates_without_per_node_allocations(self):
         outcome = self.simulate('sku_already_target', payment=True)
-        self.assertEqual(outcome['clicks'], ['立即购票', '确认', '提交订单'])
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认', '提交订单'])
         self.assertLessEqual(outcome['rectAllocations'], outcome['treeReads'])
         self.assertGreater(sum(outcome['geometryReads'].values()), outcome['rectAllocations'] * 3)
 
-    def test_retained_choice_changes_before_confirmation_prevent_order_creation(self):
-        for scenario in ['retained_tier_changed', 'retained_date_changed']:
-            with self.subTest(scenario=scenario):
-                outcome = self.simulate(scenario, payment=True)
-                self.assertEqual(outcome['clicks'], ['立即购票'])
-                self.assertTrue(any('预选场次或票档状态已变化' in log for log in outcome['logs']))
+    def test_changed_date_or_unproven_reselected_tier_prevents_order_creation(self):
+        date = self.simulate('retained_date_changed', payment=True)
+        self.assertEqual(date['clicks'], ['立即购票'])
+        self.assertTrue(any('预选场次状态已变化' in log for log in date['logs']))
+        tier = self.simulate('retained_tier_changed', payment=True)
+        self.assertEqual(tier['clicks'], ['立即购票', '看台 ¥1380'])
+        self.assertNotIn('确认', tier['clicks'])
+        self.assertNotIn('提交订单', tier['clicks'])
 
     def test_live_selectors_can_probe_all_flow_pages_without_any_action_or_lock(self):
         for scenario in ('probe_detail', 'probe_sku', 'probe_order'):
@@ -481,12 +651,12 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertGreaterEqual(outcome['detailReadStartedAfterSaleMs'][-1], 0)
         self.assertEqual(outcome['sleeps'], [20000])
 
-    def test_both_preselected_choices_skip_selection_and_one_detail_read(self):
+    def test_preselected_date_is_retained_but_target_tier_is_selected_once(self):
         outcome = self.simulate('sku_already_target')
-        self.assertEqual(outcome['clicks'], ['立即购票', '确认'])
-        self.assertLessEqual(outcome['treeReads'], 6)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+        self.assertLessEqual(outcome['treeReads'], 8)
         self.assertEqual(outcome['geometryReads']['detail'], 1)
-        self.assertTrue(any('沿用已选日期' in log and '沿用已选票档' in log
+        self.assertTrue(any('沿用已选日期' in log and '点击目标票档' in log
                             for log in outcome['logs']))
 
     def test_fast_entry_appearing_between_polls_is_seen_within_twenty_ms(self):
@@ -542,15 +712,15 @@ class AutoXLiveExportTests(unittest.TestCase):
                 self.assertEqual(facts['tierCandidates'], 1)
                 self.assertEqual(facts['tierSelected'], valid)
 
-    def test_prepared_entry_can_continue_through_actual_sku_without_reselection(self):
+    def test_prepared_entry_sets_configured_tier_once_on_actual_sku(self):
         outcome = self.simulate('prepared_to_sku', payment=True)
-        self.assertEqual(outcome['clicks'], ['立即购票', '确认', '提交订单'])
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认', '提交订单'])
         self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'payment_page')
         self.assertNotIn('detail', outcome['stateReads'])
 
     def test_prepared_entry_sku_confirmation_does_not_repeat_on_uncertain_transition(self):
         outcome = self.simulate('prepared_to_sku_no_change', payment=True)
-        self.assertEqual(outcome['clicks'], ['立即购票', '确认'])
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
         self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'not_submitted')
 
     def test_prepared_start_requires_selection_evidence(self):
@@ -558,13 +728,13 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertEqual(outcome['clicks'], [])
         self.assertFalse(outcome['diagnosticWrites'][-1]['data']['automaticPayment'])
 
-    def test_user_preselected_never_switches_tier_on_intermediate_sku(self):
+    def test_user_preselected_sets_only_configured_tier_on_intermediate_sku(self):
         outcome = self.simulate('prepared_to_sku', wechat=True)
-        self.assertEqual(outcome['clicks'], ['立即购票', '确认', '提交订单'])
-        self.assertNotIn('看台 ¥1380', outcome['clicks'])
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认', '提交订单'])
+        self.assertEqual(outcome['clicks'].count('看台 ¥1380'), 1)
 
     def test_any_configured_tier_is_reselected_when_reservation_is_lost(self):
-        for amount in [480, 580, 780, 1380, 2380]:
+        for amount in [480, 580, 780, 980, 1080, 1380, 2380]:
             with self.subTest(amount=amount):
                 result = self.simulate('sku_preselected', wechat=True, amount=amount)
                 self.assertEqual(result['clicks'], ['立即购票', f'看台 ¥{amount}', '确认', '提交订单'])
@@ -730,6 +900,11 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertLessEqual(outcome['clicks'].count('刷新'), 3000)
         self.assertLess(max(outcome['clickTimes']), 1200000)
         self.assertNotIn('提交订单', outcome['clicks'])
+        reads = outcome['diagnosticWrites'][-1]['data']['readTimings']
+        self.assertEqual(len(reads), 120)
+        self.assertGreater(reads[0]['startedAfterOriginMs'], 1000000)
+        self.assertEqual([read['startedAfterOriginMs'] for read in reads],
+                         sorted(read['startedAfterOriginMs'] for read in reads))
 
     def test_refresh_rereads_when_dialog_disappears_or_context_changes(self):
         for scenario in ['congestion_disappears', 'congestion_changed_while_waiting', 'congestion_payment']:
@@ -902,6 +1077,17 @@ class AutoXLiveExportTests(unittest.TestCase):
                 self.assertEqual(outcome['state'], 'order')
                 self.assertTrue(any('唯一观演人已勾选' in log for log in outcome['logs']))
 
+    def test_year_before_zhang_artist_name_is_not_a_ticket_quantity(self):
+        outcome = self.simulate('combined_order_numeric_zhang_title', merchant_payment=True, amount=1080)
+        self.assertEqual(outcome['clicks'], ['立即购票', '立即支付'])
+        self.assertEqual(outcome['state'], 'payment')
+        self.assertNotIn('确认支付', outcome['clicks'])
+
+    def test_zhang_artist_name_does_not_hide_a_real_two_ticket_order(self):
+        outcome = self.simulate('combined_order_numeric_zhang_title_two_tickets', merchant_payment=True, amount=1080)
+        self.assertEqual(outcome['clicks'], ['立即购票'])
+        self.assertEqual(outcome['state'], 'order')
+
     def test_unique_unchecked_attendee_is_selected_once_without_paying(self):
         outcome = self.simulate('attendee_unchecked')
         self.assertEqual(outcome['clicks'], ['立即购票', '[观演人勾选框]'])
@@ -1027,10 +1213,19 @@ class AutoXLiveExportTests(unittest.TestCase):
                 self.assertEqual(outcome['clicks'], ['立即购票'])
                 self.assertEqual(outcome['state'], 'sku')
 
-    def test_explicitly_selected_target_tier_continues_without_toggling(self):
-        outcome = self.simulate('sku_already_target')
-        self.assertEqual(outcome['clicks'], ['立即购票', '确认'])
+    def test_already_selected_target_is_clicked_once_without_preselection_branch(self):
+        outcome = self.simulate('sku_already_target', confirm_rehearsal=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
         self.assertEqual(outcome['state'], 'order')
+        self.assertEqual(outcome['clicks'].count('看台 ¥1380'), 1)
+        self.assertFalse(outcome['diagnosticWrites'][-1]['data']['skuDecision']['preselectionChecked'])
+
+    def test_reclick_that_clears_selection_cannot_confirm_or_submit(self):
+        outcome = self.simulate('sku_preselected_toggle_off', payment=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380'])
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'not_submitted')
+        self.assertNotIn('确认', outcome['clicks'])
+        self.assertNotIn('提交订单', outcome['clicks'])
 
     def test_price_tap_does_not_continue_while_choice_button_is_grey(self):
         outcome = self.simulate('price_click_no_change')
@@ -1064,10 +1259,87 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380'])
         self.assertEqual(outcome['state'], 'order')
 
-    def test_already_selected_price_is_not_toggled(self):
+    def test_unknown_selection_sets_target_once_but_never_confirms_without_proof(self):
         outcome = self.simulate('sku_already_chosen')
-        self.assertEqual(outcome['clicks'], ['立即购票'])
+        # With neither a selected flag nor a total, choose the configured card
+        # once. The unchanged mock still supplies no proof, so never confirm.
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380'])
         self.assertEqual(outcome['state'], 'sku_selected')
+
+    def test_android_preselection_without_selected_flags_selects_then_checks_split_total(self):
+        outcome = self.simulate('android_sku_preselected_split_total', amount=580)
+        self.assertEqual(outcome['clicks'], ['立即购票', '¥580', '确认'])
+        self.assertEqual(outcome['state'], 'order')
+
+    def test_android_unselected_page_without_placeholder_selects_target(self):
+        outcome = self.simulate('android_sku_unselected_no_prompt', amount=580)
+        self.assertEqual(outcome['clicks'], ['立即购票', '¥580', '确认'])
+        self.assertEqual(outcome['state'], 'order')
+
+    def test_android_limit_six_is_not_the_selected_quantity(self):
+        outcome = self.simulate('android_sku_preselected_split_total', amount=580, payment=True)
+        self.assertEqual(outcome['clicks'][-2:], ['确认', '提交订单'])
+        self.assertEqual(outcome['state'], 'payment')
+
+    def test_confirmation_rehearsal_reaches_review_without_attendee_submit_or_lock(self):
+        outcome = self.simulate('android_sku_unselected_no_prompt', amount=580, confirm_rehearsal=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '¥580', '确认'])
+        self.assertEqual(outcome['state'], 'order')
+        self.assertEqual(outcome['stored'], {})
+        self.assertEqual(outcome['lockFiles'], {})
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'order_review_reached')
+
+    def test_native_sku_clicks_date_tier_and_confirmation_without_coordinate_retries(self):
+        for scenario in ('native_sku_regular', 'native_sku_zero_width_order', 'native_sku_child_label'):
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, confirm_rehearsal=True, amount=1580)
+                self.assertEqual(outcome['nativeActions'], ['12月5日 周六 19:00', '看台 ¥1580', '确认'])
+                self.assertEqual(len(outcome['shortPresses']), 1)
+                self.assertEqual(outcome['state'], 'order')
+                diagnostic = outcome['diagnosticWrites'][-1]['data']
+                self.assertEqual(diagnostic['state'], 'order_review_reached')
+                self.assertTrue(all(t.get('method') == 'accessibility_action' for t in diagnostic['touchTimings'][1:]))
+                self.assertNotIn('提交订单', outcome['clicks'])
+
+    def test_native_sku_rejection_or_duplicate_never_falls_back_to_touch(self):
+        for scenario in ('native_sku_rejected_tier', 'native_sku_duplicate_lookup'):
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, confirm_rehearsal=True, amount=1580)
+                self.assertEqual(len(outcome['shortPresses']), 1)
+                self.assertNotIn('看台 ¥1580', outcome['clicks'])
+                self.assertNotIn('确认', outcome['clicks'])
+                self.assertEqual(outcome['state'], 'sku')
+
+    def test_two_price_labels_in_one_clickable_card_are_one_tier(self):
+        outcome = self.simulate('native_sku_double_label_card', confirm_rehearsal=True, amount=1098)
+        self.assertEqual(outcome['nativeActions'], ['12月5日 周六 19:00', '看台 ¥1098', '确认'])
+        self.assertEqual(outcome['state'], 'order')
+        self.assertEqual(outcome['clicks'].count('看台 ¥1098'), 1)
+
+    def test_split_amount_cannot_select_a_different_tier_category(self):
+        outcome = self.simulate('native_sku_double_wrong_kind', confirm_rehearsal=True, amount=1098)
+        self.assertNotIn('¥1098', outcome['clicks'])
+        self.assertNotIn('内场1098元', outcome['clicks'])
+        self.assertNotIn('确认', outcome['clicks'])
+        self.assertEqual(outcome['state'], 'sku')
+
+    def test_merchant_payment_mode_stops_before_payment_confirmation(self):
+        outcome = self.simulate('wechat_payment_sheet_full_flow', merchant_payment=True, amount=780)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥780', '确认', '立即支付'])
+        self.assertEqual(outcome['state'], 'payment_sheet')
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'pending_payment_sheet')
+        self.assertNotIn('确认支付', outcome['clicks'])
+        cashier = self.simulate('wechat_cashier_selected', merchant_payment=True)
+        self.assertNotIn('立即支付', cashier['clicks'])
+
+    def test_android_wrong_total_or_two_tickets_never_confirms(self):
+        for scenario in ('android_sku_wrong_total', 'android_sku_two_tickets',
+                         'android_sku_total_changed_before_confirm', 'android_sku_substring_price'):
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, amount=580, payment=True)
+                self.assertNotIn('确认', outcome['clicks'])
+                self.assertNotIn('提交订单', outcome['clicks'])
+                self.assertNotEqual(outcome['state'], 'payment')
 
     def test_duplicate_price_candidates_never_click_either(self):
         outcome = self.simulate('duplicate_price_sku')

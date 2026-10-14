@@ -86,6 +86,15 @@ def build_selection_rehearsal_script(profile: dict, template: str | None = None)
     return script.replace(gate, 'var SELECTION_REHEARSAL = true;', 1)
 
 
+def build_selection_confirmation_rehearsal_script(profile: dict, template: str | None = None) -> str:
+    """Choose one ticket and confirm to order review; never submit or pay."""
+    script = build_selection_rehearsal_script(profile, template)
+    gate = 'var CONFIRM_SELECTION_REHEARSAL = false;'
+    if script.count(gate) != 1 or 'var SUBMIT_TO_PAYMENT = false;' not in script:
+        raise RuntimeError('手机端确认选档演练开关异常。')
+    return script.replace(gate, 'var CONFIRM_SELECTION_REHEARSAL = true;', 1)
+
+
 def build_payment_script(profile: dict, template: str | None = None) -> str:
     """Submit an explicit order-creation action once, then stop at cashier."""
     script = build_live_script(profile, template)
@@ -131,6 +140,15 @@ def build_wechat_script(profile: dict, template: str | None = None) -> str:
     if script.count(selected_gate) != 1:
         raise RuntimeError('手机端用户预选开关异常。')
     return script.replace(selected_gate, 'var USER_PRESELECTED = true;', 1)
+
+
+def build_merchant_payment_script(profile: dict, template: str | None = None) -> str:
+    """Create the configured order once and stop at the merchant cashier."""
+    script = build_wechat_script(profile, template)
+    gate = 'var STOP_AT_MERCHANT_PAYMENT = false;'
+    if script.count(gate) != 1:
+        raise RuntimeError('手机端商户付款页停止开关异常。')
+    return script.replace(gate, 'var STOP_AT_MERCHANT_PAYMENT = true;', 1)
 
 
 def build_flow_probe_script(profile: dict, template: str | None = None) -> str:
