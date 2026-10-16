@@ -259,6 +259,19 @@ class ApiTests(unittest.TestCase):
 
 
 class ProfileTests(unittest.TestCase):
+    def test_available_tier_fallback_is_opt_in_and_saved_only_for_maoyan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp)/'profiles.json')
+            old = store.save({**PROFILE, 'platform': 'maoyan'})
+            self.assertFalse(old['available_tier_fallback'])
+            new = store.save({**old, 'available_tier_fallback': True})
+            self.assertTrue(store.get(new['id'])['available_tier_fallback'])
+            for invalid in ('true', 1, None):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    store.save({**new, 'available_tier_fallback': invalid})
+            with self.assertRaises(ValueError):
+                store.save({**PROFILE, 'available_tier_fallback': True})
+
     def test_selection_source_is_saved_and_legacy_profiles_keep_workbench_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = ProfileStore(Path(tmp)/'profiles.json')
@@ -268,6 +281,19 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(store.get(new['id'])['selection_source'], 'phone')
             with self.assertRaises(ValueError):
                 store.save({**old, 'selection_source': 'unknown'})
+
+    def test_date_selection_mode_is_saved_without_changing_legacy_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / 'profiles.json')
+            old = store.save({**PROFILE, 'platform': 'maoyan'})
+            self.assertEqual(old['date_selection_mode'], 'select_target')
+            new = store.save({**old, 'date_selection_mode': 'keep_current'})
+            self.assertEqual(store.get(new['id'])['date_selection_mode'], 'keep_current')
+            for invalid in (None, True, 'guess', ''):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    store.save({**new, 'date_selection_mode': invalid})
+            with self.assertRaises(ValueError):
+                store.save({**PROFILE, 'date_selection_mode': 'keep_current'})
 
     def test_maps_to_upstream_modes_and_multiple_users(self):
         with tempfile.TemporaryDirectory() as tmp:

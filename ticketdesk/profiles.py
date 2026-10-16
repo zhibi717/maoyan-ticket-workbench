@@ -30,6 +30,16 @@ def validate_profile(value):
     selection_source = value.get('selection_source', 'workbench')
     if selection_source not in ('phone', 'workbench'):
         raise ValueError('请选择手机预选或工作台填写的票档来源。')
+    date_selection_mode = value.get('date_selection_mode', 'select_target')
+    if date_selection_mode not in ('select_target', 'keep_current'):
+        raise ValueError('请选择切换目标日期或沿用当前日期。')
+    if date_selection_mode == 'keep_current' and platform != 'maoyan':
+        raise ValueError('沿用当前日期目前只支持猫眼。')
+    available_tier_fallback = value.get('available_tier_fallback', False)
+    if not isinstance(available_tier_fallback, bool):
+        raise ValueError('回流票替补开关须为开启或关闭。')
+    if available_tier_fallback and platform != 'maoyan':
+        raise ValueError('回流票替补目前只支持猫眼。')
     if not re.search(r'\d', price):
         raise ValueError('票档请填写所选平台页面原文和金额。')
     amount_match = re.search(r'(?<!\d)(\d{2,5})(?!\d)', price)
@@ -72,6 +82,8 @@ def validate_profile(value):
                 event_time=event_time.isoformat(),
                 price=price, amount=amount, users=users, sale_time=sale.isoformat(),
                 selection_source=selection_source,
+                date_selection_mode=date_selection_mode,
+                available_tier_fallback=available_tier_fallback,
                 price_index=index, serial=serial.strip(), target_title=target_title.strip(),
                 target_venue=target_venue.strip())
 

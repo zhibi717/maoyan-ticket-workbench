@@ -31,6 +31,147 @@ RAW_PROFILE = {
 
 
 class AutoXLiveExportTests(unittest.TestCase):
+    def test_incomplete_startup_recovers_without_touching_until_identity_matches(self):
+        result = self.simulate('startup_incomplete', payment=True)
+        self.assertEqual(result['clicks'][0], '立即购票')
+        self.assertEqual(result['clicks'].count('提交订单'), 1)
+        record = result['diagnosticWrites'][-1]['data']
+        self.assertTrue(any(mark.startswith('详情页信息重读恢复=') for mark in record['marks']))
+
+    def test_incomplete_startup_is_bounded_and_wrong_identity_never_clicks(self):
+        for scenario in ('startup_never_ready', 'startup_wrong_city', 'startup_incomplete_challenge'):
+            with self.subTest(scenario=scenario):
+                result = self.simulate(scenario, payment=True)
+                self.assertEqual(result['clicks'], [])
+                self.assertLessEqual(result['treeReads'], 31)
+
+    def test_seat_purchase_is_recognized_as_detail_entry(self):
+        result = self.simulate('entry_seat_purchase', payment=True)
+        self.assertEqual(result['clicks'][0], '选座购票')
+
+    def test_discount_booking_is_recognized_as_detail_entry(self):
+        result = self.simulate('entry_discount_booking', merchant_payment=True)
+        self.assertEqual(result['clicks'][0], '特惠预订')
+        self.assertEqual(result['diagnosticWrites'][-1]['data']['state'], 'payment_page')
+        self.assertEqual(result['clicks'].count('提交订单'), 1)
+
+    def test_keep_current_date_exports_and_validates_mode(self):
+        script = build_merchant_payment_script(validate_profile({**RAW_PROFILE, 'date_selection_mode': 'keep_current'}))
+        self.assertIn('"dateSelectionMode":"keep_current"', script)
+        legacy = validate_profile(RAW_PROFILE)
+        legacy.pop('date_selection_mode')
+        self.assertIn('"dateSelectionMode":"select_target"', build_live_script(legacy))
+        with self.assertRaises(ValueError):
+            build_live_script({**legacy, 'date_selection_mode': 'guess'})
+
+    def test_keep_current_date_avoids_date_reload_with_or_without_selected_flags(self):
+        for scenario in ('fallback_keep_current_unmarked', 'fallback_keep_current_marked'):
+            with self.subTest(scenario=scenario):
+                result = self.simulate(scenario, date_mode='keep_current', merchant_payment=True)
+                self.assertEqual(result['clicks'], ['立即购票', '看台 ¥1380', '确认', '立即支付'])
+                self.assertEqual(result['state'], 'payment_sheet')
+                decision = result['diagnosticWrites'][-1]['data']['dateDecision']
+                self.assertFalse(decision['clicked'])
+                self.assertEqual(decision['selectedStateObserved'], scenario.endswith('_marked'))
+        # The same fixture resets the tier after a redundant date click.
+        old = self.simulate('fallback_keep_current_unmarked', merchant_payment=True)
+        self.assertIn('12月5日 周六 19:00', old['clicks'])
+        self.assertNotIn('确认', old['clicks'])
+
+    def test_keep_current_date_allows_authorized_fallback_and_preserves_rehearsal(self):
+        result = self.simulate('fallback_keep_current_sold', date_mode='keep_current', fallback=True, merchant_payment=True)
+        self.assertEqual(result['clicks'], ['立即购票', '看台 ¥780', '确认', '立即支付'])
+        rehearsal = self.simulate('fallback_keep_current_unmarked', date_mode='keep_current', rehearsal=True)
+        self.assertEqual(rehearsal['clicks'], ['立即购票', '看台 ¥1380'])
+
+    def test_keep_current_date_rejects_visible_mismatch_missing_date_and_changed_date(self):
+        for scenario in ('fallback_keep_current_wrong_date', 'fallback_keep_current_missing', 'fallback_keep_current_changed'):
+            with self.subTest(scenario=scenario):
+                result = self.simulate(scenario, date_mode='keep_current', fallback=True, merchant_payment=True)
+                self.assertNotIn('确认', result['clicks'])
+                self.assertNotIn('立即支付', result['clicks'])
+                self.assertFalse(any('周' in label for label in result['clicks']))
+
+    def test_keep_current_date_still_rejects_wrong_date_on_order(self):
+        result = self.simulate('fallback_keep_current_wrong_order', date_mode='keep_current', merchant_payment=True)
+        self.assertEqual(result['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+        self.assertNotIn('立即支付', result['clicks'])
+
+    def test_available_tier_fallback_exports_explicit_boolean_and_rejects_fixed_path(self):
+        profile = validate_profile({**RAW_PROFILE, 'available_tier_fallback': True})
+        script = build_wechat_script(profile)
+        self.assertIn('"availableTierFallback":true', script)
+        self.assertIn('"availableTierFallback":false', build_live_script(validate_profile(RAW_PROFILE)))
+        with self.assertRaises(ValueError):
+            build_fixed_coordinate_payment_script(profile, {
+                'width': 1080, 'height': 2376, 'gapMs': 5,
+                'entry': [600, 2150], 'tier': [300, 560], 'confirm': [860, 2150]})
+
+    def test_available_tier_fallback_prefers_primary_then_lowest_available(self):
+        primary = self.simulate('fallback_primary_available', fallback=True, merchant_payment=True)
+        self.assertEqual(primary['clicks'], ['立即购票', '看台 ¥1380', '确认', '立即支付'])
+        self.assertIsNone(primary['diagnosticWrites'][-1]['data']['fallbackSelection'])
+        fallback = self.simulate('fallback_any', fallback=True, merchant_payment=True)
+        self.assertEqual(fallback['clicks'], ['立即购票', '看台 ¥780', '确认', '立即支付'])
+        details = fallback['diagnosticWrites'][-1]['data']
+        self.assertEqual(details['requestedAmount'], 1380)
+        self.assertEqual(details['selectedAmount'], 780)
+        self.assertEqual(details['fallbackSelection']['date'], '2026-12-05')
+        self.assertTrue(details['skuDecision']['fallbackUsed'])
+
+    def test_available_tier_fallback_allows_higher_price_and_keeps_payment_checks(self):
+        higher = self.simulate('fallback_higher_only', fallback=True, wechat=True)
+        self.assertEqual(higher['clicks'], ['立即购票', '内场 ¥2080', '确认', '立即支付', '确认支付'])
+        self.assertEqual(higher['state'], 'wechat')
+        self.assertTrue(all(touch['state'] != 'wechat' for touch in higher['shortPresses']))
+        wrong_cashier = self.simulate('fallback_wrong_cashier', fallback=True, wechat=True)
+        self.assertEqual(wrong_cashier['clicks'], ['立即购票', '看台 ¥780', '确认', '立即支付'])
+        self.assertEqual(wrong_cashier['state'], 'payment_sheet')
+
+    def test_available_tier_fallback_handles_missing_disabled_and_ambiguous_cards(self):
+        for scenario, label in (('fallback_target_missing', '看台 ¥780'),
+                                ('fallback_disabled_low', '内场 ¥2080'),
+                                ('fallback_not_clickable', '内场 ¥2080'),
+                                ('fallback_reserved', '内场 ¥2080'),
+                                ('fallback_sibling_sold', '内场 ¥2080'),
+                                ('fallback_duplicate', '内场 ¥2080')):
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, fallback=True, confirm_rehearsal=True)
+                self.assertEqual(outcome['clicks'], ['立即购票', label, '确认'])
+                self.assertEqual(outcome['state'], 'order')
+
+    def test_available_tier_fallback_off_or_all_sold_does_not_click_other_tiers(self):
+        for scenario, enabled in (('fallback_any', False), ('fallback_all_sold', True),
+                                  ('fallback_wrong_date', True), ('fallback_race', True)):
+            with self.subTest(scenario=scenario, enabled=enabled):
+                outcome = self.simulate(scenario, fallback=enabled, merchant_payment=True)
+                self.assertNotIn('看台 ¥780', outcome['clicks'])
+                self.assertNotIn('内场 ¥2080', outcome['clicks'])
+                self.assertNotIn('确认', outcome['clicks'])
+                self.assertNotIn('提交订单', outcome['clicks'])
+                self.assertNotIn('立即支付', outcome['clicks'])
+
+    def test_available_tier_fallback_still_requires_selected_price_quantity_and_order(self):
+        for scenario in ('fallback_wrong_total', 'fallback_wrong_quantity', 'fallback_unselected',
+                         'fallback_wrong_order'):
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, fallback=True, merchant_payment=True)
+                self.assertIn('看台 ¥780', outcome['clicks'])
+                self.assertNotIn('提交订单', outcome['clicks'])
+                self.assertNotIn('立即支付', outcome['clicks'])
+                if scenario != 'fallback_wrong_order':
+                    self.assertNotIn('确认', outcome['clicks'])
+
+    def test_available_tier_fallback_rehearsal_selects_without_confirming(self):
+        outcome = self.simulate('fallback_any', fallback=True, rehearsal=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥780'])
+        self.assertEqual(outcome['state'], 'sku_selected')
+
+    def test_available_fallback_retains_sole_unmarked_date_without_reloading_tiers(self):
+        outcome = self.simulate('fallback_single_date_unmarked', fallback=True, merchant_payment=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥780', '确认', '立即支付'])
+        self.assertEqual(outcome['state'], 'payment_sheet')
+
     def test_fixed_coordinate_build_is_separate_and_guards_final_order(self):
         profile = validate_profile(RAW_PROFILE)
         points = {'width': 1080, 'height': 2376, 'gapMs': 5,
@@ -80,7 +221,8 @@ class AutoXLiveExportTests(unittest.TestCase):
                     self.assertGreaterEqual(outcome['diagnosticWrites'][-1]['data']['entryTouchCount'], 1)
 
     def simulate(self, scenario, *, rehearsal=False, confirm_rehearsal=False, merchant_payment=False, probe=False, payment=False, congestion_probe=False, wechat=False,
-                 capture=False, amount=1380, source='workbench', initial_storage=None, template=None):
+                 capture=False, amount=1380, source='workbench', initial_storage=None, template=None,
+                  fallback=False, date_mode='select_target', bounded_retry=False, single_confirm=False):
         node = shutil.which('node')
         if not node:
             self.skipTest('Node.js is needed for offline AutoX mock')
@@ -99,8 +241,17 @@ class AutoXLiveExportTests(unittest.TestCase):
             builder = build_wechat_script
         if capture:
             builder = build_selection_capture_script
-        raw = {**RAW_PROFILE, 'price': f'看台 {amount} 元', 'selection_source': source}
+        raw = {**RAW_PROFILE, 'price': f'看台 {amount} 元', 'selection_source': source,
+               'available_tier_fallback': fallback, 'date_selection_mode': date_mode}
         script = builder(validate_profile(raw), template=template)
+        if bounded_retry:
+            script = script.replace('var MAX_SKU_CONFIRM_TOUCHES = null;',
+                                    'var MAX_SKU_CONFIRM_TOUCHES = 3;', 1)
+            script = script.replace('var SKU_CONFIRM_RETRY_MS = 80;',
+                                    'var SKU_CONFIRM_RETRY_MS = 200;', 1)
+        if single_confirm:
+            script = script.replace('var ENABLE_SAME_PAGE_CONFIRM_RETRY = true;',
+                                    'var ENABLE_SAME_PAGE_CONFIRM_RETRY = false;', 1)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'synthetic-only.js'
             path.write_text(script, encoding='utf-8')
@@ -539,7 +690,7 @@ class AutoXLiveExportTests(unittest.TestCase):
         previous = (Path(__file__).resolve().parents[1] / 'autox' / 'versions' /
                     'maoyan_live_before_readiness_timing_20261014.js').read_text(encoding='utf-8')
         old = self.simulate('order_still_shows_sku', merchant_payment=True, template=previous)
-        new = self.simulate('order_still_shows_sku', merchant_payment=True)
+        new = self.simulate('order_still_shows_sku', merchant_payment=True, single_confirm=True)
         self.assertEqual(new['clicks'], old['clicks'])
         self.assertEqual(new['clickTimes'], old['clickTimes'])
         self.assertGreater(old['geometryReads'].get('order_pending_sku', 0), 0)
@@ -718,9 +869,11 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'payment_page')
         self.assertNotIn('detail', outcome['stateReads'])
 
-    def test_prepared_entry_sku_confirmation_does_not_repeat_on_uncertain_transition(self):
+    def test_prepared_entry_retries_without_feedback_by_default(self):
         outcome = self.simulate('prepared_to_sku_no_change', payment=True)
-        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+        self.assertEqual(outcome['clicks'][:2], ['立即购票', '看台 ¥1380'])
+        self.assertGreater(outcome['clicks'].count('确认'), 3)
+        self.assertEqual(outcome['clicks'].count('看台 ¥1380'), 1)
         self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'not_submitted')
 
     def test_prepared_start_requires_selection_evidence(self):
@@ -1233,11 +1386,189 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertEqual(outcome['state'], 'sku')
         self.assertNotIn('submit_clicked', str(outcome['stored']))
 
-    def test_confirm_tap_is_not_repeated_when_page_does_not_change(self):
-        outcome = self.simulate('confirm_click_no_change')
-        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+    def test_confirm_retries_are_limited_and_spaced_on_verified_unchanged_page(self):
+        outcome = self.simulate('confirm_click_no_change', payment=True, bounded_retry=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认', '确认', '确认'])
         self.assertEqual(outcome['state'], 'sku_selected')
         self.assertTrue(any('未确认进入订单页' in log for log in outcome['logs']))
+        diagnostic = outcome['diagnosticWrites'][-1]['data']
+        retry = diagnostic['skuConfirmRetry']
+        self.assertEqual(retry['touchCount'], 3)
+        self.assertEqual(retry['stoppedReason'], 'max_touches')
+        confirms = [t for t in diagnostic['touchTimings'] if t['stage'] == '票档确认']
+        self.assertEqual(len(confirms), 3)
+        for first, second in zip(confirms, confirms[1:]):
+            self.assertGreaterEqual(second['startedAfterOriginMs'] - first['startedAfterOriginMs'], 200)
+        self.assertTrue(all(t['method'] == 'screen_touch' for t in confirms))
+
+    def test_first_ignored_confirm_is_retried_then_stops_at_review(self):
+        outcome = self.simulate('confirm_retry_first_ignored', confirm_rehearsal=True, bounded_retry=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认', '确认'])
+        self.assertEqual(outcome['state'], 'order')
+        diagnostic = outcome['diagnosticWrites'][-1]['data']
+        self.assertEqual(diagnostic['skuConfirmRetry']['touchCount'], 2)
+        self.assertEqual(diagnostic['skuConfirmRetry']['stoppedReason'], 'order_observed')
+        self.assertEqual(outcome['stored'], {})
+        self.assertEqual(outcome['lockFiles'], {})
+
+    def test_loading_does_not_receive_confirm_touches(self):
+        for scenario in ('order_long_delay',):
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, confirm_rehearsal=True, bounded_retry=True)
+                self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+                self.assertEqual(outcome['state'], 'order')
+
+    def test_confirm_retries_resume_after_temporary_loading_disappears(self):
+        outcome = self.simulate('confirm_retry_loading_overlay', confirm_rehearsal=True)
+        self.assertEqual(outcome['state'], 'order')
+        result = outcome['diagnosticWrites'][-1]['data']
+        confirms = [t for t in result['touchTimings'] if t['stage'] == '票档确认']
+        self.assertGreater(len(confirms), 1)
+        self.assertTrue(all(t['startedAfterOriginMs'] - confirms[0]['startedAfterOriginMs'] >= 120
+                            for t in confirms[1:]))
+
+    def test_confirm_waits_through_incomplete_selection_flags_then_processes_order(self):
+        outcome = self.simulate('order_still_shows_sku', merchant_payment=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认', '提交订单'])
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'payment_page')
+
+    def test_continuous_confirm_can_recover_after_more_than_three_ignored_touches(self):
+        outcome = self.simulate('confirm_retry_fourth_accepted', merchant_payment=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380'] + ['确认'] * 4 + ['立即支付'])
+        self.assertEqual(outcome['state'], 'payment_sheet')
+        self.assertEqual(outcome['clicks'].count('看台 ¥1380'), 1)
+        self.assertNotIn('确认支付', outcome['clicks'])
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['skuConfirmRetry']['touchCount'], 4)
+
+    def test_default_continuous_confirm_retries_without_feedback_until_time_budget(self):
+        outcome = self.simulate('confirm_click_no_change', payment=True)
+        self.assertGreater(outcome['clicks'].count('确认'), 3)
+        self.assertEqual(outcome['clicks'].count('看台 ¥1380'), 1)
+        self.assertNotIn('提交订单', outcome['clicks'])
+        result = outcome['diagnosticWrites'][-1]['data']
+        retry = result['skuConfirmRetry']
+        self.assertEqual(retry['policy'], 'continuous_same_page')
+        self.assertIsNone(retry['maxTouches'])
+        self.assertEqual(retry['timeBudgetMs'], 8000)
+        self.assertEqual(retry['stoppedReason'], 'deadline')
+        confirms = [t for t in result['touchTimings'] if t['stage'] == '票档确认']
+        self.assertEqual(len(confirms), retry['touchCount'])
+        for first, second in zip(confirms, confirms[1:]):
+            self.assertGreaterEqual(second['startedAfterOriginMs'] - first['startedAfterOriginMs'], 80)
+        self.assertTrue(all(t['method'] == 'screen_touch' for t in confirms))
+
+    def test_confirm_retry_rechecks_date_amount_quantity_button_and_verification(self):
+        for change in ('changed_date', 'changed_total', 'changed_quantity', 'disabled', 'moved_button', 'challenge'):
+            with self.subTest(change=change):
+                outcome = self.simulate('confirm_retry_' + change, merchant_payment=True, bounded_retry=True)
+                self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+                self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'not_submitted')
+                self.assertEqual(outcome['diagnosticWrites'][-1]['data']['skuConfirmRetry']['touchCount'], 1)
+
+    def test_confirm_retry_still_submits_once_and_stops_before_merchant_confirmation(self):
+        outcome = self.simulate('confirm_retry_merchant', merchant_payment=True, bounded_retry=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认', '确认', '立即支付'])
+        self.assertEqual(outcome['state'], 'payment_sheet')
+        self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'pending_payment_sheet')
+        self.assertNotIn('确认支付', outcome['clicks'])
+
+    def test_selection_only_rehearsal_does_not_start_confirm_retries(self):
+        outcome = self.simulate('confirm_retry_first_ignored', rehearsal=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380'])
+
+    def test_single_confirm_comparison_remains_available(self):
+        outcome = self.simulate('confirm_retry_first_ignored', merchant_payment=True, single_confirm=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+        retry = outcome['diagnosticWrites'][-1]['data']['skuConfirmRetry']
+        self.assertEqual(retry['policy'], 'observe_feedback')
+        self.assertEqual(retry['maxTouches'], 1)
+        self.assertIsNone(retry['minIntervalMs'])
+        self.assertEqual(retry['stoppedReason'], 'no_confirmed_progress')
+
+    def test_confirm_failure_feedback_is_recorded_and_stops_before_timeout(self):
+        for suffix, code in [('stock_tree', 'stock_unavailable'), ('error_tree', 'request_failed'),
+                             ('stock_toast', 'stock_unavailable'), ('error_toast', 'request_failed')]:
+            with self.subTest(suffix=suffix):
+                outcome = self.simulate('confirm_feedback_' + suffix, merchant_payment=True)
+                self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+                result = outcome['diagnosticWrites'][-1]['data']
+                self.assertEqual(result['state'], 'not_submitted')
+                self.assertEqual(result['skuConfirmRetry']['stoppedReason'], code)
+                self.assertTrue(any(code in item['codes'] for item in result['confirmationFeedback']))
+                self.assertEqual(result['touchTimings'][-1]['apiReturnedSuccess'], True)
+                self.assertLess(outcome['finishedAfterSaleMs'] -
+                                result['touchTimings'][-1]['startedAfterOriginMs'], 8000)
+                self.assertNotIn('测试观演人', json.dumps(result, ensure_ascii=False))
+                self.assertNotIn('13800138000', json.dumps(result, ensure_ascii=False))
+                self.assertEqual(outcome['toastListenersRemaining'], 0)
+
+    def test_loading_feedback_can_progress_without_another_confirm(self):
+        outcome = self.simulate('order_long_delay', confirm_rehearsal=True)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+        self.assertEqual(outcome['state'], 'order')
+        feedback = outcome['diagnosticWrites'][-1]['data']['confirmationFeedback']
+        self.assertTrue(any('loading' in item['codes'] for item in feedback))
+        self.assertTrue(any('order_marker' in item['codes'] for item in feedback))
+
+    def test_unknown_and_foreign_toasts_never_trigger_purchase_retries(self):
+        for suffix in ('unknown_toast', 'foreign_toast', 'before_toast'):
+            with self.subTest(suffix=suffix):
+                outcome = self.simulate('confirm_feedback_' + suffix, confirm_rehearsal=True)
+                self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+                self.assertEqual(outcome['state'], 'order')
+                result = outcome['diagnosticWrites'][-1]['data']
+                toasts = [item for item in result['confirmationFeedback'] if item['source'] == 'toast']
+                self.assertEqual(len(toasts), 1 if suffix == 'unknown_toast' else 0)
+                if toasts: self.assertEqual(toasts[0]['codes'], ['unclassified_toast'])
+                self.assertNotIn('13800138000', json.dumps(result))
+
+    def test_toast_observer_failure_is_reported_without_blocking_normal_progress(self):
+        for suffix in ('observer_missing', 'observer_failed', 'callback_failed', 'no_threads'):
+            with self.subTest(suffix=suffix):
+                outcome = self.simulate('confirm_feedback_' + suffix, confirm_rehearsal=True)
+                self.assertEqual(outcome['state'], 'order')
+                observer = outcome['diagnosticWrites'][-1]['data']['toastObserver']
+                if suffix == 'observer_missing': self.assertFalse(observer['supported'])
+                if suffix == 'no_threads': self.assertFalse(observer['supported'])
+                if suffix == 'observer_failed': self.assertTrue(observer['failed'])
+                if suffix == 'callback_failed': self.assertEqual(observer['callbackErrors'], 1)
+                self.assertEqual(outcome['toastListenersRemaining'], 0)
+                self.assertEqual(outcome['observerThreadsStarted'], outcome['observerThreadsInterrupted'])
+
+    def test_toast_burst_keeps_latest_stock_result_and_bounded_diagnostics(self):
+        outcome = self.simulate('confirm_feedback_toast_burst', merchant_payment=True)
+        result = outcome['diagnosticWrites'][-1]['data']
+        self.assertEqual(result['skuConfirmRetry']['stoppedReason'], 'stock_unavailable')
+        self.assertLessEqual(len(result['confirmationFeedback']), 32)
+        self.assertEqual(outcome['clicks'], ['立即购票', '看台 ¥1380', '确认'])
+        self.assertNotIn('13800138000', json.dumps(result))
+        self.assertEqual(outcome['observerThreadsStarted'], 1)
+        self.assertEqual(outcome['observerThreadsInterrupted'], 1)
+
+    def test_confirmation_api_failure_or_exception_has_separate_call_result(self):
+        for scenario in ('wechat_payment_sheet_full_flow_failed_confirm', 'confirm_feedback_touch_throws'):
+            with self.subTest(scenario=scenario):
+                outcome = self.simulate(scenario, merchant_payment=True)
+                result = outcome['diagnosticWrites'][-1]['data']
+                confirm = result['touchTimings'][-1]
+                self.assertEqual(confirm['stage'], '票档确认')
+                self.assertFalse(confirm['apiReturnedSuccess'])
+                self.assertEqual(confirm['callThrew'], scenario == 'confirm_feedback_touch_throws')
+                self.assertEqual(result['skuConfirmRetry']['touchCount'], 1)
+                self.assertEqual(result['skuConfirmRetry']['stoppedReason'],
+                                 'dispatch_exception' if scenario == 'confirm_feedback_touch_throws' else 'dispatch_failed')
+                self.assertNotIn('立即支付', outcome['clicks'])
+
+    def test_feedback_capture_does_not_add_android_reads_on_success_path(self):
+        previous = (Path(__file__).resolve().parents[1] / 'autox/versions' /
+                    'maoyan_live_bounded_confirm_retry_experimental_20261015.js').read_text(encoding='utf-8')
+        old = self.simulate('wechat_payment_sheet_full_flow', merchant_payment=True, template=previous)
+        new = self.simulate('wechat_payment_sheet_full_flow', merchant_payment=True)
+        self.assertEqual(new['clicks'], old['clicks'])
+        self.assertEqual(new['treeReads'], old['treeReads'])
+        self.assertEqual(new['geometryReads'], old['geometryReads'])
+        self.assertEqual(new['propertyReads'], old['propertyReads'])
+        self.assertEqual(new['toastListenersRemaining'], 0)
 
     def test_wrong_quantity_after_price_never_confirms(self):
         outcome = self.simulate('wrong_quantity_after_price')
@@ -1289,16 +1620,17 @@ class AutoXLiveExportTests(unittest.TestCase):
         self.assertEqual(outcome['lockFiles'], {})
         self.assertEqual(outcome['diagnosticWrites'][-1]['data']['state'], 'order_review_reached')
 
-    def test_native_sku_clicks_date_tier_and_confirmation_without_coordinate_retries(self):
+    def test_native_sku_date_and_tier_use_native_action_but_confirm_uses_screen_touch(self):
         for scenario in ('native_sku_regular', 'native_sku_zero_width_order', 'native_sku_child_label'):
             with self.subTest(scenario=scenario):
                 outcome = self.simulate(scenario, confirm_rehearsal=True, amount=1580)
-                self.assertEqual(outcome['nativeActions'], ['12月5日 周六 19:00', '看台 ¥1580', '确认'])
-                self.assertEqual(len(outcome['shortPresses']), 1)
+                self.assertEqual(outcome['nativeActions'], ['12月5日 周六 19:00', '看台 ¥1580'])
+                self.assertEqual(len(outcome['shortPresses']), 2)
                 self.assertEqual(outcome['state'], 'order')
                 diagnostic = outcome['diagnosticWrites'][-1]['data']
                 self.assertEqual(diagnostic['state'], 'order_review_reached')
-                self.assertTrue(all(t.get('method') == 'accessibility_action' for t in diagnostic['touchTimings'][1:]))
+                self.assertTrue(all(t.get('method') == 'accessibility_action' for t in diagnostic['touchTimings'][1:3]))
+                self.assertEqual(diagnostic['touchTimings'][-1]['method'], 'screen_touch')
                 self.assertNotIn('提交订单', outcome['clicks'])
 
     def test_native_sku_rejection_or_duplicate_never_falls_back_to_touch(self):
@@ -1312,7 +1644,7 @@ class AutoXLiveExportTests(unittest.TestCase):
 
     def test_two_price_labels_in_one_clickable_card_are_one_tier(self):
         outcome = self.simulate('native_sku_double_label_card', confirm_rehearsal=True, amount=1098)
-        self.assertEqual(outcome['nativeActions'], ['12月5日 周六 19:00', '看台 ¥1098', '确认'])
+        self.assertEqual(outcome['nativeActions'], ['12月5日 周六 19:00', '看台 ¥1098'])
         self.assertEqual(outcome['state'], 'order')
         self.assertEqual(outcome['clicks'].count('看台 ¥1098'), 1)
 

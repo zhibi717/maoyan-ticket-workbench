@@ -46,6 +46,12 @@ def build_locked_prototype(profile: dict, template: str | None = None) -> str:
     if sale.tzinfo is None or sale.utcoffset() is None:
         raise ValueError('开售时间必须包含时区。')
     sale_ms = int(sale.timestamp() * 1000)
+    fallback = profile.get('available_tier_fallback', False)
+    if not isinstance(fallback, bool):
+        raise ValueError('回流票替补开关无效。')
+    date_mode = profile.get('date_selection_mode', 'select_target')
+    if date_mode not in ('select_target', 'keep_current'):
+        raise ValueError('日期选择模式无效。')
     target = {
         **event,
         'attendeeCount': 1,
@@ -55,6 +61,8 @@ def build_locked_prototype(profile: dict, template: str | None = None) -> str:
         'attemptKey': f'{identifier}:{sale_ms}',
         'selectionSource': profile.get('selection_source', 'workbench'),
         'tierLabel': profile['price'],
+        'availableTierFallback': fallback,
+        'dateSelectionMode': date_mode,
         'selectionKey': 'selection:' + hashlib.sha256(json.dumps(
             [identifier, sale_ms, event, profile['price']], sort_keys=True
         ).encode('utf-8')).hexdigest(),
@@ -107,6 +115,8 @@ def build_payment_script(profile: dict, template: str | None = None) -> str:
 def build_fixed_coordinate_payment_script(profile: dict, coordinates: dict,
                                           template: str | None = None) -> str:
     """Timed first taps, then guarded order and Maoyan-to-WeChat submission."""
+    if profile.get('available_tier_fallback', False):
+        raise ValueError('回流票替补须使用正常选档脚本，不能使用固定坐标实验。')
     width = coordinates.get('width')
     height = coordinates.get('height')
     gap = coordinates.get('gapMs')

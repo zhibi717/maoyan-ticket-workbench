@@ -9,8 +9,13 @@ const inputScenario = process.argv[3];
 const nativeOrderCase = inputScenario.startsWith('native_order_') ? inputScenario.slice(13) : null;
 const scenario = nativeOrderCase ? 'wechat_payment_sheet_full_flow' : inputScenario;
 const target = JSON.parse(script.match(/^var TARGET = (.+);$/m)[1]);
+const fallbackScenario = scenario.startsWith('fallback_');
+const keepCurrentScenario = scenario.startsWith('fallback_keep_current_');
+const requestedAmount = target.amount;
 const androidSkuScenario = scenario.startsWith('android_sku_');
 const nativeSkuScenario = scenario.startsWith('native_sku_');
+const confirmRetryScenario = scenario.startsWith('confirm_retry_');
+const confirmFeedbackScenario = scenario.startsWith('confirm_feedback_');
 const numericZhangTitleScenario = scenario.startsWith('combined_order_numeric_zhang');
 const combinedOrderScenario = scenario === 'combined_order_summary' || numericZhangTitleScenario;
 const nativeActions = [];
@@ -18,9 +23,9 @@ const androidSkuFixture = androidSkuScenario ? JSON.parse(fs.readFileSync(
     require('path').join(__dirname, 'fixtures', 'maoyan_sku_split_total.json'), 'utf8')) : null;
 const maskedScenario = scenario.startsWith('wechat_masked_');
 const paymentSheetScenario = scenario.startsWith('wechat_payment_sheet') ||
-    scenario === 'wechat_masked_selected_sheet' || scenario === 'payment_order_sheet';
+    scenario === 'wechat_masked_selected_sheet' || scenario === 'payment_order_sheet' || fallbackScenario || confirmRetryScenario;
 const fullFastFlowScenario = scenario.startsWith('wechat_payment_sheet_full_flow');
-const actualAmount = scenario.startsWith('wechat_preselected_price') || scenario.startsWith('phone_') ? 580 : target.amount;
+let actualAmount = scenario.startsWith('wechat_preselected_price') || scenario.startsWith('phone_') ? 580 : target.amount;
 const chosenAmount = scenario.startsWith('phone_') ? 580 : target.amount;
 let now = target.saleEpochMs + 1000;
 if (['spaced_reservation', 'slow_countdown', 'slow_countdown_challenge'].includes(scenario)) now = target.saleEpochMs - 30000;
@@ -32,6 +37,7 @@ let state = 'detail';
 if (scenario.startsWith('prepared_')) state = 'prepared';
 if (scenario === 'prepared_countdown') now = target.saleEpochMs - 20060;
 let dateClicked = false;
+let fallbackDateRefreshPending = false;
 if (scenario === 'probe_order') state = 'order';
 if (scenario.startsWith('probe_congestion')) state = 'order';
 if (scenario === 'probe_sku') state = 'sku';
@@ -39,6 +45,7 @@ let attendeeChecked = false;
 let attendeeCheckedAt = Infinity;
 let selectedSkuAt = Infinity;
 let orderReadyAt = Infinity;
+let firstConfirmAt = Infinity;
 let entryReadyAt = Infinity;
 let rectAllocations = 0;
 let congestionVisible = scenario.startsWith('probe_congestion');
@@ -138,14 +145,63 @@ function item(label, index) {
                 label === '看台 ¥' + target.amount), bounds: {
         left: label === '刷新' && congestionVisible ? 500 : confirmation ? 640 + index * 10 : 20 + index * 2,
         top: label === '刷新' && congestionVisible ? 850 : confirmation ? 2070 + index * 5 :
-            label.indexOf('立即') === 0 || label === '提交订单' ? 2100 : 400 + index * 70,
+            label.indexOf('立即') === 0 || ['提交订单', '选座购票', '特惠预订'].includes(label) ? 2100 : 400 + index * 70,
         right: label === '刷新' && congestionVisible ? 800 : confirmation ? 990 + index * 10 : 600 + index * 2,
         bottom: label === '刷新' && congestionVisible ? 920 : confirmation ? 2180 + index * 5 :
-            label.indexOf('立即') === 0 || label === '提交订单' ? 2210 : 450 + index * 70
+            label.indexOf('立即') === 0 || ['提交订单', '选座购票', '特惠预订'].includes(label) ? 2210 : 450 + index * 70
     }};
 }
 function rows() {
     if (androidSkuScenario && ['sku', 'sku_selected'].includes(state)) return androidSkuRows();
+    if (fallbackScenario && ['sku', 'sku_selected'].includes(state)) {
+        if (fallbackDateRefreshPending && state === 'sku_selected') {
+            state = 'sku';
+            selectedSkuAt = Infinity;
+            fallbackDateRefreshPending = false;
+        }
+        const choices = scenario === 'fallback_higher_only' ? ['内场 ¥2080'] :
+            scenario === 'fallback_all_sold' ? ['看台 ¥780 缺货登记', '内场 ¥2080 售罄'] :
+                ['内场 ¥2080', '看台 ¥780', '看台 ¥580 缺货登记'];
+        if (scenario !== 'fallback_target_missing') choices.unshift('看台 ¥' + requestedAmount +
+            (scenario === 'fallback_primary_available' || keepCurrentScenario &&
+                scenario !== 'fallback_keep_current_sold' ? '' : ' 缺货登记'));
+        if (scenario === 'fallback_duplicate') choices.push('看台 ¥780');
+        if (scenario === 'fallback_reserved') choices[choices.indexOf('看台 ¥780')] += ' 可预约';
+        const labels = ['选择票档', dateLabel, '票档', ...choices, '优惠 ¥100'];
+        if (scenario === 'fallback_sibling_sold') labels.push('缺货登记');
+        if (scenario === 'fallback_wrong_date') labels.splice(2, 0, '2026-12-06 周日 19:00');
+        if (keepCurrentScenario) labels.splice(2, 0, '2026-12-06 周日 19:00', '2026-12-07 周一 19:00');
+        if (scenario === 'fallback_keep_current_missing') labels.splice(labels.indexOf(dateLabel), 1);
+        if (state === 'sku') labels.push('请选择票档');
+        else labels.push(scenario === 'fallback_wrong_quantity' ? '2张' : '1张',
+            '总计:￥' + (scenario === 'fallback_wrong_total' ? actualAmount + 100 : actualAmount), '确认');
+        return labels.map(item).map((row, index) => {
+            row.bounds = {left: 40, top: 650 + index * 100, right: 680, bottom: 715 + index * 100};
+            if (row.text === '选择票档') row.bounds.top = 150, row.bounds.bottom = 210;
+            if (row.text === dateLabel) row.bounds.top = 350, row.bounds.bottom = 415;
+            if (row.text === '2026-12-06 周日 19:00') row.bounds.top = 450, row.bounds.bottom = 515;
+            if (row.text === '2026-12-07 周一 19:00') row.bounds.top = 520, row.bounds.bottom = 550;
+            if (row.text === '票档') row.bounds.top = 550, row.bounds.bottom = 615;
+            if (/^\d张$/.test(row.text)) row.bounds.top = 1970, row.bounds.bottom = 2030;
+            if (row.text.startsWith('总计')) row.bounds.top = 2140, row.bounds.bottom = 2210;
+            if (row.text === '确认' || row.text === '请选择票档') row.bounds = {left:700,top:2160,right:1000,bottom:2260};
+            row.selected = row.text === dateLabel && scenario !== 'fallback_wrong_date' ||
+                state === 'sku_selected' && row.text === '看台 ¥' + actualAmount ||
+                state === 'sku_selected' && row.text === '内场 ¥' + actualAmount;
+            if (scenario === 'fallback_single_date_unmarked' && row.text === dateLabel) row.selected = false;
+            if (keepCurrentScenario && row.text === dateLabel) row.selected = scenario === 'fallback_keep_current_marked';
+            if (keepCurrentScenario && row.text === '2026-12-06 周日 19:00') {
+                row.selected = scenario === 'fallback_keep_current_wrong_date' ||
+                    scenario === 'fallback_keep_current_changed' && state === 'sku_selected';
+            }
+            if (scenario === 'fallback_wrong_date' && row.text === '2026-12-06 周日 19:00') row.selected = true;
+            if ((scenario === 'fallback_disabled_low' || scenario === 'fallback_race' && stateReads.sku >= 2) && row.text === '看台 ¥780') row.enabled = false;
+            if (scenario === 'fallback_not_clickable' && row.text === '看台 ¥780') row.clickable = false;
+            if (scenario === 'fallback_unselected' && state === 'sku_selected' && row.text !== dateLabel) row.selected = false;
+            if (scenario === 'fallback_unselected' && row.text.startsWith('总计')) row.text = '总计';
+            return row;
+        });
+    }
     if (state === 'prepared') {
         const labels = [target.titleToken, target.city, '场次', '票档', dateLabel,
             '看台 ¥' + target.amount, scenario === 'prepared_two_tickets' ? '2张' : '1张',
@@ -165,9 +221,15 @@ function rows() {
         });
     }
     if (state === 'detail') {
+        if (scenario === 'startup_incomplete' && stateReads.detail < 3 ||
+                scenario === 'startup_never_ready') return ['加载中'].map(item);
+        if (scenario === 'startup_incomplete_challenge') return ['加载中', '人机验证'].map(item);
         const labels = [target.titleToken, target.city,
             scenario.startsWith('fixed_reservation_') && now >= target.saleEpochMs - 1000 ? '开售' : '已预约',
             '立即购票'];
+        if (scenario === 'startup_wrong_city') labels[1] = '其他城市';
+        if (scenario === 'entry_seat_purchase') labels[3] = '选座购票';
+        if (scenario === 'entry_discount_booking') labels[3] = '特惠预订';
         if (scenario.startsWith('presale_reservation_')) labels[2] = '开售';
         if (scenario === 'presale_reservation_missing_no_entry') labels.pop();
         if (scenario === 'slow_entry' && stateReads.detail < 5) labels.pop();
@@ -209,14 +271,32 @@ function rows() {
         if (scenario === 'quantity_long_delay' && now < selectedSkuAt + 1200) labels.splice(3, 1);
         if (scenario === 'quantity_short_delay' && now < selectedSkuAt + 96) labels.splice(3, 1);
         if (scenario === 'ambiguous_confirm') labels.push('确认');
-        return labels.map(item);
+        if (firstConfirmAt !== Infinity) {
+            if (scenario === 'confirm_retry_loading_overlay' && now < firstConfirmAt + 120) labels.push('加载中');
+            if (scenario === 'confirm_retry_changed_quantity') labels[3] = '2张';
+            if (scenario === 'confirm_retry_changed_date') labels[1] = '2026-12-06 周日 19:00';
+            if (scenario === 'confirm_retry_changed_total') labels.push('总计:￥' + (target.amount + 100));
+            if (scenario === 'confirm_retry_challenge') labels.push('人机验证');
+            if (scenario === 'confirm_feedback_stock_tree') labels.push('库存不足');
+            if (scenario === 'confirm_feedback_error_tree') labels.push('请求失败，请稍后重试');
+        }
+        return labels.map(item).map(row => {
+            if (scenario === 'confirm_retry_changed_total' && row.text.startsWith('总计')) {
+                row.bounds = {left: 40, top: 2140, right: 480, bottom: 2210};
+            }
+            if (firstConfirmAt !== Infinity && row.text === '确认') {
+                if (scenario === 'confirm_retry_disabled') row.enabled = false;
+                if (scenario === 'confirm_retry_moved_button') row.bounds.top = 1000, row.bounds.bottom = 1100;
+            }
+            return row;
+        });
     }
     if (state === 'order' || state === 'payment_sheet') {
         const price = combinedOrderScenario ? '看台 ￥' + target.amount +
             (scenario.endsWith('_two_tickets') ? ' ×2张' : ' ×1张') :
             scenario === 'decimal_price_payment_label' ?
             '¥' + target.amount + '.00' : '¥' +
-            (scenario === 'wrong_order_price' ? target.amount + 100 :
+            (scenario === 'wrong_order_price' || scenario === 'fallback_wrong_order' ? target.amount + 100 :
                 scenario === 'substring_order_price' ? 11380 :
                     state === 'payment_sheet' && scenario === 'wechat_payment_sheet_right_amount_background_wrong' ? actualAmount + 100 : actualAmount);
         const attendeeName = maskedScenario ?
@@ -227,7 +307,7 @@ function rows() {
         const orderTitle = numericZhangTitleScenario ? '2\u200b0\u200b2\u200b6张智霖 “在” ' + target.titleToken :
             scenario === 'native_sku_zero_width_order' ? target.titleToken.split('').join('\u200b') : target.titleToken;
         const labels = [orderTitle, target.city,
-            scenario === 'wrong_order_date' ? '2026-12-06 周日 19:00' : dateLabel,
+            scenario === 'wrong_order_date' || scenario === 'fallback_keep_current_wrong_order' ? '2026-12-06 周日 19:00' : dateLabel,
             price, '实名观演人', attendeeName];
         const immediateReview = combinedOrderScenario || ['instant_pay_order', 'wechat_immediate_review'].includes(scenario) ||
             maskedScenario || paymentSheetScenario && scenario !== 'payment_order_sheet';
@@ -263,7 +343,8 @@ function rows() {
         }
         if (state === 'payment_sheet' || scenario === 'wechat_payment_sheet_before_submit' && stateReads.order >= 3) {
             const amount = scenario === 'wechat_payment_sheet_wrong_amount_background_right' ||
-                scenario === 'wechat_payment_sheet_amount_changed_before_review' && stateReads.payment_sheet >= 2 ? 1580 : actualAmount;
+                scenario === 'wechat_payment_sheet_amount_changed_before_review' && stateReads.payment_sheet >= 2 ? 1580 :
+                    scenario === 'fallback_wrong_cashier' ? actualAmount + 100 : actualAmount;
             const sheetLabels = ['支付订单', '支付剩余时间 14:59', '¥' + amount + '.00', '支付方式', '微信支付', '云闪付', '确认支付'];
             if (scenario === 'wechat_payment_sheet_missing_method') sheetLabels.splice(3, 1);
             if (scenario === 'wechat_payment_sheet_ambiguous_amount') sheetLabels.splice(3, 0, '¥' + (amount + 100) + '.00');
@@ -321,6 +402,13 @@ function rows() {
     if (state === 'challenge') return [item('人机验证', 0)];
     return [item('加载中', 0)];
 }
+const toastListeners = [];
+let observerThreadsStarted = 0;
+let observerThreadsInterrupted = 0;
+function emitToast(message, pkg) {
+    const event = {getPackageName: () => pkg || target.package, getText: () => message};
+    for (const listener of [...toastListeners]) listener(event);
+}
 function clickRow(row) {
     clicks.push(row.text);
     clickTimes.push(now - target.saleEpochMs);
@@ -348,7 +436,7 @@ function clickRow(row) {
     if (state === 'prepared' && ['立即购票', '确认'].includes(row.text)) {
         if (scenario.startsWith('prepared_to_sku')) state = 'sku_selected';
         else if (scenario !== 'prepared_no_change') state = 'order';
-    } else if (state === 'detail' && row.text === '立即购票') {
+    } else if (state === 'detail' && ['立即购票', '选座购票', '特惠预订'].includes(row.text)) {
         if (scenario === 'entry_first_touch_ignored' &&
                 clicks.filter(label => label === '立即购票').length === 1) return true;
         state = ['sku_already_chosen', 'sku_already_target', 'sku_preselected_toggle_off', 'retained_tier_changed', 'retained_date_changed'].includes(scenario) ? 'sku_selected' :
@@ -363,12 +451,22 @@ function clickRow(row) {
         if (scenario === 'challenge_after_entry') state = 'challenge';
         if (scenario.startsWith('phone_') || scenario === 'price_wrong_selection' || fullFastFlowScenario) state = 'sku';
         if (nativeSkuScenario) state = 'sku';
+        if (confirmRetryScenario) state = 'sku';
+        if (confirmFeedbackScenario) state = 'sku';
+        if (fallbackScenario) state = 'sku';
         if (scenario.startsWith('transition_entry_')) {
             state = 'entry_loading';
             if (scenario === 'transition_entry_timed') entryReadyAt = now + 96;
         }
         if (androidSkuScenario) state = ['android_sku_unselected_no_prompt', 'android_sku_substring_price'].includes(scenario) ? 'sku' : 'sku_selected';
         if (scenario.startsWith('congestion_') && scenario !== 'congestion_after_submit') congestionVisible = true;
+    } else if ((scenario === 'fallback_single_date_unmarked' || keepCurrentScenario) && state === 'sku' && row.text === dateLabel) {
+        fallbackDateRefreshPending = true;
+    } else if (fallbackScenario && state === 'sku' && /^(?:看台|内场) ¥\d+$/.test(row.text)) {
+        actualAmount = Number(row.text.match(/\d+/)[0]);
+        target.amount = actualAmount;
+        selectedSkuAt = now;
+        state = 'sku_selected';
     } else if (state === 'sku_selected' && scenario === 'sku_preselected_toggle_off' && row.text === '看台 ¥' + target.amount) {
         state = 'sku';
         selectedSkuAt = Infinity;
@@ -383,6 +481,33 @@ function clickRow(row) {
         if (scenario === 'price_auto_order') state = 'order';
         else if (scenario !== 'price_click_no_change') state = 'sku_selected';
     } else if (state === 'sku_selected' && row.text === '确认') {
+        if (firstConfirmAt === Infinity) firstConfirmAt = now;
+        if (confirmFeedbackScenario) {
+            if (scenario === 'confirm_feedback_stock_toast') emitToast('测试观演人13800138000：库存不足');
+            if (scenario === 'confirm_feedback_error_toast') emitToast('请求失败：13800138000');
+            if (scenario === 'confirm_feedback_foreign_toast') emitToast('库存不足', 'another.app');
+            if (scenario === 'confirm_feedback_unknown_toast') emitToast('测试观演人13800138000其他消息');
+            if (scenario === 'confirm_feedback_toast_burst') {
+                for (let n = 0; n < 100; n++) emitToast('13800138000其他消息');
+                emitToast('库存不足');
+            }
+            if (scenario === 'confirm_feedback_callback_failed') {
+                for (const listener of [...toastListeners]) listener({getPackageName: () => target.package,
+                    getText: () => {throw new Error('Private message must not escape');}});
+            }
+            if (['confirm_feedback_stock_tree', 'confirm_feedback_error_tree',
+                 'confirm_feedback_stock_toast', 'confirm_feedback_error_toast'].includes(scenario)) return true;
+            if (scenario === 'confirm_feedback_toast_burst') return true;
+        }
+        if (confirmRetryScenario) {
+            if (['confirm_retry_first_ignored', 'confirm_retry_merchant', 'confirm_retry_fourth_accepted'].includes(scenario)) {
+                const acceptedTouch = scenario === 'confirm_retry_fourth_accepted' ? 4 : 2;
+                if (clicks.filter(label => label === '确认').length < acceptedTouch) return true;
+            } else {
+                if (scenario === 'confirm_retry_loading_overlay') orderReadyAt = firstConfirmAt + 600;
+                return true;
+            }
+        }
         if (scenario === 'order_long_delay') { state = 'order_loading'; orderReadyAt = now + 5000; }
         else if (scenario === 'order_still_shows_sku') { state = 'order_pending_sku'; orderReadyAt = now + 96; }
         else if (!['confirm_click_no_change', 'prepared_to_sku_no_change'].includes(scenario)) state = 'order';
@@ -501,6 +626,7 @@ function nativeRoot() {
             now >= entryReadyAt : stateReads.entry_loading >= 3)) state = 'sku';
     if (state === 'order_loading' && now >= orderReadyAt) state = 'order';
     if (state === 'order_pending_sku' && now >= orderReadyAt) state = 'order';
+    if (scenario === 'confirm_retry_loading_overlay' && now >= orderReadyAt) state = 'order';
     if (scenario === 'transition_entry_challenge' && state === 'sku' && stateReads.sku >= 1) state = 'challenge';
     if (scenario === 'congestion_disappears' && refreshCount >= 1) congestionVisible = false;
     // Introduce a verification overlay specifically at the fresh pre-click read.
@@ -566,8 +692,14 @@ function nativeRoot() {
             dialogChildren.push(nativeRow(row));
             continue;
         }
-        if (scenario === 'sold_out_sibling' && row.text === '缺货登记') continue;
-        if (scenario === 'sold_out_sibling' && row.text === '看台 ¥' + target.amount) {
+        if ((scenario === 'sold_out_sibling' || scenario === 'fallback_sibling_sold' && state === 'sku') && row.text === '缺货登记') continue;
+        if (scenario === 'fallback_sibling_sold' && state === 'sku' && row.text === '看台 ¥780') {
+            const badge = records.find(record => record.text === '缺货登记');
+            badge.bounds = {left:400, top:row.bounds.top, right:600, bottom:row.bounds.bottom};
+            children.push(nativeRow({text:'',enabled:true,clickable:true,
+                bounds:{left:20,top:row.bounds.top-10,right:700,bottom:row.bounds.bottom+10}},
+                [nativeRow(row),nativeRow(badge)]));
+        } else if (scenario === 'sold_out_sibling' && row.text === '看台 ¥' + target.amount) {
             children.push(nativeRow({text: '', enabled: true,
                 bounds: {left: 10, top: 500, right: 700, bottom: 770}},
                 [nativeRow(row), nativeRow(records.find(record => record.text === '缺货登记'))]));
@@ -631,6 +763,18 @@ function nativeRoot() {
     return root;
 }
 const context = {
+    threads: {start: fn => {
+        observerThreadsStarted++; fn();
+        return {interrupt: () => {observerThreadsInterrupted++;}};
+    }},
+    setInterval: () => 1,
+    events: {
+        observeToast: () => {if (scenario === 'confirm_feedback_observer_failed') throw new Error('Private observer error');},
+        onToast: fn => toastListeners.push(fn),
+        removeListener: (name, fn) => {
+            if (name === 'toast' && toastListeners.includes(fn)) toastListeners.splice(toastListeners.indexOf(fn), 1);
+        }
+    },
     RegExp: function (pattern, flags) { regexCompilations++; return new RegExp(pattern, flags); },
     auto: { waitFor: () => {}, setMode: () => {}, service: {
         getRootInActiveWindow: nativeRoot
@@ -645,7 +789,10 @@ const context = {
             y <= row.bounds.bottom);
         return match ? clickRow(match) : false;
     },
-    sleep: ms => { sleeps.push(ms); now += ms; },
+    sleep: ms => {
+        sleeps.push(ms); now += ms;
+        if (scenario === 'confirm_feedback_before_toast' && ms === 20000) emitToast('库存不足');
+    },
     Date: { now: () => now },
     device: { width: 1080, height: scenario.startsWith('fixed_reservation_') || androidSkuScenario ? 2376 : 2400 },
     currentPackage: () => scenario === 'stale_current_package' ? 'com.android.launcher' : target.package,
@@ -670,7 +817,11 @@ const context = {
         put: (key, value) => { stored[key] = value; }
     }) },
     context: { getFilesDir: () => '/private' },
-    java: { lang: { String: function (value) { this.getBytes = () => value; } },
+    java: { util: {concurrent: {LinkedBlockingQueue: function (limit) {
+        const items = [];
+        this.offer = item => {if (items.length >= limit) return false; items.push(item); return true;};
+        this.poll = () => items.length ? items.shift() : null;
+    }}}, lang: { String: function (value) { this.getBytes = () => value; } },
         security: { MessageDigest: { getInstance: () => ({
             digest: value => { hashComputations++; return Array.from(crypto.createHash('sha256').update(value, 'utf8').digest()); }
         }) } }, io: { File: function (parent, name) {
@@ -686,6 +837,7 @@ const context = {
 const shortPresses = [];
 context.press = (x, y, duration) => {
     shortPresses.push({duration, state});
+    if (scenario === 'confirm_feedback_touch_throws' && state === 'sku_selected') throw new Error('Private touch error');
     if (scenario === 'entry_press_failed') return false;
     if (scenario === 'wechat_payment_sheet_full_flow_failed_confirm' && state === 'sku_selected') return false;
     if (scenario === 'wechat_payment_sheet_full_flow_failed_submit' && state === 'order') return false;
@@ -693,6 +845,8 @@ context.press = (x, y, duration) => {
     return context.click(x, y);
 };
 if (scenario === 'wechat_payment_sheet_full_flow_no_press') delete context.press;
+if (scenario === 'confirm_feedback_observer_missing') delete context.events;
+if (scenario === 'confirm_feedback_no_threads') delete context.threads;
 vm.runInNewContext(script, context, { timeout: 2000 });
-process.stdout.write(JSON.stringify({ nativeActions, shortPresses, clicks, clickTimes, onSaleDetailReads, logs, stored, lockFiles, state, treeReads, selectorReads, diagnosticWrites, propertyReads, geometryReads, stateReads, detailReadStartedAfterSaleMs, sleeps, rectAllocations, congestionNonRefreshGeometryReads, congestionUnderlyingGeometryReads, hashComputations, regexCompilations, unrecycledNativeNodes, doubleNativeRecycles }));
+process.stdout.write(JSON.stringify({ nativeActions, shortPresses, clicks, clickTimes, onSaleDetailReads, logs, stored, lockFiles, state, treeReads, selectorReads, diagnosticWrites, propertyReads, geometryReads, stateReads, detailReadStartedAfterSaleMs, sleeps, rectAllocations, congestionNonRefreshGeometryReads, congestionUnderlyingGeometryReads, hashComputations, regexCompilations, unrecycledNativeNodes, doubleNativeRecycles, toastListenersRemaining:toastListeners.length, observerThreadsStarted, observerThreadsInterrupted, finishedAfterSaleMs:now-target.saleEpochMs }));
 

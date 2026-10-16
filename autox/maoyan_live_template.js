@@ -16,6 +16,8 @@ var USER_PRESELECTED = false;
 var CAPTURE_SELECTION_ONLY = false;
 var FAST_FIXED_PATH = false;
 var FAST_COORDS = null;
+// Repeat only the live SKU confirmation. Each new page uses its own flow.
+var ENABLE_SAME_PAGE_CONFIRM_RETRY = true;
 
 (function () {
     if (!ENABLE_EXPERIMENTAL_LIVE) {
@@ -31,8 +33,8 @@ var FAST_COORDS = null;
     }
 
     var PACKAGE = TARGET.package;
-    var ENTRY = ["立即预订", "立即预定", "立即购票", "立即抢购", "立即抢票", "特惠购票", "立即购买"];
-    var ENTRY_PATTERN = /^(?:立即预订|立即预定|立即购票|立即抢购|立即抢票|特惠购票|立即购买)$/;
+    var ENTRY = ["立即预订", "立即预定", "立即购票", "立即抢购", "立即抢票", "特惠购票", "特惠预订", "立即购买", "选座购票"];
+    var ENTRY_PATTERN = /^(?:立即预订|立即预定|立即购票|立即抢购|立即抢票|特惠购票|特惠预订|立即购买|选座购票)$/;
     var CHALLENGE = ["图片验证", "图片识别", "图形验证", "安全验证", "人机验证", "请完成验证", "滑块验证", "点击图片", "验证码"];
     // An order review can itself list available payment methods. Do not
     // classify that label alone as the payment screen.
@@ -43,6 +45,9 @@ var FAST_COORDS = null;
     var SKU_CONFIRM = ["确认", "确定"];
     var ENTRY_TRANSITION_POLL_MS = 20;
     var SELECTION_READY_POLL_MS = 20;
+    var SKU_CONFIRM_RETRY_MS = 80;
+    var MAX_SKU_CONFIRM_TOUCHES = null;
+    var SKU_CONFIRM_OBSERVE_MS = 8000;
     var storage;
     var phase = "启动";
     var marks = [];
@@ -64,12 +69,36 @@ var FAST_COORDS = null;
     var preparedProbe = null;
     var terminalState = "not_submitted";
     var retainedDateSelection = false;
+    var keptCurrentDate = false;
+    var dateDecision = null;
     var retainedSingleDate = false;
     var entryFoundEpochMs = null;
     var entryClickEpochMs = null;
     var entryClickCallMs = null;
     var entryTouchCount = 0;
     var lastEntryTouchEpochMs = null;
+    var skuConfirmTouchCount = 0;
+    var lastSkuConfirmTouchEpochMs = null;
+    var skuConfirmRetryStopReason = null;
+    var confirmFeedbackActive = false;
+    var confirmationFeedback = [];
+    var lastConfirmationFeedbackKey = null;
+    var confirmationFailure = null;
+    var feedbackCaptureMs = 0;
+    var feedbackCaptureMaxMs = 0;
+    var toastListener = null;
+    var toastThread = null;
+    var toastEventQueue = null;
+    var toastObserver = {supported:false, started:false, failed:false, callbackErrors:0, mode:"observer_thread"};
+    var FEEDBACK_RULES = [
+        {code:"stock_unavailable", pattern:/库存不足|余票不足|所选票档已售罄|该票档已售罄/},
+        {code:"request_failed", pattern:/请求失败|请求超时|网络异常|网络开小差|网络不给力|网络连接失败|系统繁忙|服务器繁忙|操作失败|操作频繁|访问频繁/},
+        {code:"loading", pattern:/加载中|正在加载|正在跳转|排队中|请稍候|请稍等|提交中|正在提交|请求中/},
+        {code:"congestion", pattern:/前方拥堵|请刷新重试/},
+        {code:"verification", pattern:/图片验证|图片识别|图形验证|安全验证|人机验证|请完成验证|滑块验证|点击图片|验证码/},
+        {code:"order_marker", pattern:/实名观演人|确认购票|确认购买/},
+        {code:"payment_marker", pattern:/支付订单|支付剩余时间|输入支付密码|确认付款/}
+    ];
     var entryDecisionReadMs = null;
     var entryNextPageEpochMs = null;
     var congestionRefreshes = 0;
@@ -78,6 +107,8 @@ var FAST_COORDS = null;
     var datePattern = null;
     var rawAmount = String(TARGET.amount);
     var amountTokens = [rawAmount, rawAmount.replace(/\B(?=(\d{3})+(?!\d))/g, ",")];
+    var requestedAmount = TARGET.amount;
+    var fallbackSelection = null;
     var nameDigests = {};
     var digestCacheCount = 0;
     var screenPackage = PACKAGE;
@@ -161,7 +192,132 @@ var FAST_COORDS = null;
         phase = name;
         marks.push(name + "=" + (Date.now() - timeOrigin) + "ms");
     }
+    function skuConfirmRetryReport() {
+        return {touchCount:skuConfirmTouchCount,
+            policy:ENABLE_SAME_PAGE_CONFIRM_RETRY ? "continuous_same_page" : "observe_feedback",
+            maxTouches:ENABLE_SAME_PAGE_CONFIRM_RETRY ? MAX_SKU_CONFIRM_TOUCHES : 1,
+            minIntervalMs:ENABLE_SAME_PAGE_CONFIRM_RETRY ? SKU_CONFIRM_RETRY_MS : null,
+            timeBudgetMs:SKU_CONFIRM_OBSERVE_MS,
+            stoppedReason:skuConfirmRetryStopReason,
+            feedbackCaptureMs:feedbackCaptureMs, feedbackCaptureMaxMs:feedbackCaptureMaxMs};
+    }
+    function feedbackCodes(text, codes) {
+        for (var i = 0; i < FEEDBACK_RULES.length; i++) {
+            var rule = FEEDBACK_RULES[i];
+            if (codes.indexOf(rule.code) < 0 && rule.pattern.test(text)) codes.push(rule.code);
+        }
+    }
+    function recordConfirmationFeedback(source, codes, nodeCount, observedEpochMs) {
+        if (!confirmFeedbackActive) return;
+        codes.sort();
+        var key = source + ":" + nodeCount + ":" + codes.join(",") + ":" + skuConfirmTouchCount;
+        if (source === "tree" && key === lastConfirmationFeedbackKey) return;
+        if (source === "tree") lastConfirmationFeedbackKey = key;
+        var observed = observedEpochMs === undefined ? Date.now() : observedEpochMs;
+        var item = {source:source, codes:codes, nodes:nodeCount,
+            afterOriginMs:observed-timeOrigin, touchOrdinal:skuConfirmTouchCount,
+            afterConfirmMs:lastSkuConfirmTouchEpochMs === null ? null : observed-lastSkuConfirmTouchEpochMs};
+        if (confirmationFeedback.length >= 32) confirmationFeedback.shift();
+        confirmationFeedback.push(item);
+        if (codes.indexOf("stock_unavailable") >= 0 || codes.indexOf("request_failed") >= 0) {
+            confirmationFailure = item;
+        }
+    }
+    function captureConfirmationTree() {
+        if (!confirmFeedbackActive || screen === null) return;
+        var started = Date.now();
+        var codes = [];
+        for (var i = 0; i < screen.length; i++) {
+            // Fixed categories only. Never save raw labels, names or numbers.
+            // Long event notices are not treated as current failure messages.
+            if (screen[i].label.length <= 80) feedbackCodes(screen[i].label, codes);
+            if (screen[i].description.length <= 80) feedbackCodes(screen[i].description, codes);
+        }
+        recordConfirmationFeedback("tree", codes, screen.length);
+        var elapsed = Date.now() - started;
+        feedbackCaptureMs += elapsed;
+        feedbackCaptureMaxMs = Math.max(feedbackCaptureMaxMs, elapsed);
+    }
+    function startToastObserver() {
+        if (FLOW_PRECHECK_ONLY || PRECHECK_ONLY || typeof events === "undefined") return;
+        toastObserver.supported = typeof events.observeToast === "function" &&
+            typeof events.onToast === "function" && typeof events.removeListener === "function" &&
+            typeof threads !== "undefined" && typeof threads.start === "function";
+        if (!toastObserver.supported) return;
+        toastListener = function (event) {
+            if (!confirmFeedbackActive) return;
+            try {
+                if (String(event.getPackageName()) !== PACKAGE) return;
+                var codes = [];
+                feedbackCodes(String(event.getText() || ""), codes);
+                if (!codes.length) codes.push("unclassified_toast");
+                enqueueToastFeedback({type:"toast", codes:codes, observedEpochMs:Date.now()});
+            } catch (ignoredToast) { enqueueToastFeedback({type:"callback_error"}); }
+        };
+        try {
+            toastEventQueue = new java.util.concurrent.LinkedBlockingQueue(64);
+            // AutoX delivers callbacks on their registering thread. A listener
+            // on the purchase thread would be starved by its polling loops.
+            // Keep a separate event loop; transfer only fixed-category JSON
+            // through a Java queue, not a shared mutable JavaScript array.
+            toastThread = threads.start(function () {
+                try {
+                    events.observeToast();
+                    events.onToast(toastListener);
+                    enqueueToastFeedback({type:"started"});
+                    setInterval(function () {}, 1000);
+                } catch (ignoredObserver) {
+                    enqueueToastFeedback({type:"observer_failed"});
+                    try { events.removeListener("toast", toastListener); } catch (ignoredCleanup) {}
+                }
+            });
+        } catch (ignoredObserver) {
+            toastObserver.failed = true;
+            try { events.removeListener("toast", toastListener); } catch (ignoredCleanup) {}
+        }
+    }
+    function enqueueToastFeedback(item) {
+        if (toastEventQueue === null) return;
+        var encoded = JSON.stringify(item);
+        if (!toastEventQueue.offer(encoded)) {
+            toastEventQueue.poll(); // Keep the latest bounded diagnostic window.
+            toastEventQueue.offer(encoded);
+        }
+    }
+    function drainToastFeedback() {
+        if (toastEventQueue === null) return;
+        for (var i = 0; i < 64; i++) {
+            var encoded = toastEventQueue.poll();
+            if (encoded === null) break;
+            var item = JSON.parse(String(encoded));
+            if (item.type === "started") toastObserver.started = true;
+            else if (item.type === "observer_failed") toastObserver.failed = true;
+            else if (item.type === "callback_error") toastObserver.callbackErrors++;
+            else if (item.type === "toast" && confirmFeedbackActive &&
+                    item.observedEpochMs >= lastSkuConfirmTouchEpochMs) {
+                recordConfirmationFeedback("toast", item.codes, null, item.observedEpochMs);
+            }
+        }
+    }
+    function stopToastObserver() {
+        confirmFeedbackActive = false;
+        if (toastListener !== null && typeof events !== "undefined") {
+            try { events.removeListener("toast", toastListener); } catch (ignoredCleanup) {}
+        }
+        if (toastThread !== null) {
+            try { toastThread.interrupt(); } catch (ignoredThreadCleanup) {}
+        }
+    }
+    function stopOnConfirmationFailure() {
+        if (!confirmFeedbackActive || confirmationFailure === null ||
+                hasAny(ORDER_TITLE) || has("实名观演人")) return;
+        var stock = confirmationFailure.codes.indexOf("stock_unavailable") >= 0;
+        skuConfirmRetryStopReason = stock ? "stock_unavailable" : "request_failed";
+        stop(stock ? "票档确认后收到库存不足反馈，已停止；未提交订单。" :
+            "票档确认后收到网络或请求失败反馈，已停止；未提交订单，请在手机核对。");
+    }
     function report(message) {
+        drainToastFeedback();
         // Only fixed stage names and relative timings are emitted. No account,
         // attendee, or raw screen text is included in the diagnostic log.
         var line = message + "；阶段=" + phase + "；轨迹=" + marks.join(",") +
@@ -179,6 +335,8 @@ var FAST_COORDS = null;
                     screenRootReadMs: screenRootReadMs, screenTreeCopyMs: screenTreeCopyMs,
                     readTimings: readTimings,
                     transitionTimings: transitionReport(),
+                    skuConfirmRetry: skuConfirmRetryReport(),
+                    confirmationFeedback: confirmationFeedback, toastObserver: toastObserver,
                     congestionProbe: congestionProbe,
                     preparedProbe: preparedProbe,
                     message: line
@@ -189,7 +347,10 @@ var FAST_COORDS = null;
             try {
                 files.write("/sdcard/Download/qiangpiao-selection-confirm-result.json", JSON.stringify({
                     startedEpochMs: timeOrigin, finishedEpochMs: Date.now(), state: terminalState,
-                    amount: TARGET.amount, marks: marks, touchTimings: touchTimings,
+                    amount: TARGET.amount, requestedAmount: requestedAmount,
+                    fallbackSelection: fallbackSelection, dateDecision: dateDecision, marks: marks, touchTimings: touchTimings,
+                    skuConfirmRetry: skuConfirmRetryReport(),
+                    confirmationFeedback: confirmationFeedback, toastObserver: toastObserver,
                     screenReads: screenReads, screenReadMs: screenReadMs,
                     readTimings: readTimings,
                     transitionTimings: transitionReport(),
@@ -213,6 +374,8 @@ var FAST_COORDS = null;
                         entryClickEpochMs - entryFoundEpochMs,
                     entryClickCallMs: entryClickCallMs,
                     entryTouchCount: entryTouchCount,
+                    skuConfirmRetry: skuConfirmRetryReport(),
+                    confirmationFeedback: confirmationFeedback, toastObserver: toastObserver,
                     entryDecisionReadMs: entryDecisionReadMs,
                     fastFixedPath: FAST_FIXED_PATH,
                     configuredGapMs: FAST_FIXED_PATH && FAST_COORDS ? FAST_COORDS.gapMs : null,
@@ -222,6 +385,8 @@ var FAST_COORDS = null;
                     wechatLaunchAttempted: wechatLaunchAttempted,
                     touchTimings: touchTimings,
                     skuDecision: skuDecision,
+                    requestedAmount: requestedAmount, selectedAmount: TARGET.amount,
+                    fallbackSelection: fallbackSelection, dateDecision: dateDecision,
                     marks: marks,
                     message: line, automaticPayment: false
                 }));
@@ -236,6 +401,9 @@ var FAST_COORDS = null;
         return String(value || "").replace(/[\u200B\uFEFF]/g, "");
     }
     function nativeSkuClickOnce(node, stage) {
+        // A native ACTION_CLICK can return true without advancing Maoyan's
+        // confirmation sheet. Use a fresh-bound screen touch for this button.
+        if (stage === "票档确认") return null;
         if (["目标日期", "目标票档", "票档确认"].indexOf(stage) < 0 || !nativeSkuClickSupported) return null;
         var started = Date.now(), root = auto.service.getRootInActiveWindow();
         if (root === null) stop(stage + "原生窗口不可用，已停止。");
@@ -271,10 +439,14 @@ var FAST_COORDS = null;
             }
             // One native action. A rejected/uncertain action is never followed
             // by a coordinate touch that could toggle the selection again.
-            var clicked = target.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK);
+            var clicked = null, callThrew = false;
+            try { clicked = target.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK); }
+            catch (ignoredAction) { callThrew = true; }
             touchTimings.push({stage:stage, x:Math.floor((current.left+current.right)/2),
                 y:Math.floor((current.top+current.bottom)/2), startedAfterOriginMs:started-timeOrigin,
-                callMs:Date.now()-started, pressDurationMs:null, method:"accessibility_action"});
+                callMs:Date.now()-started, pressDurationMs:null, method:"accessibility_action",
+                apiReturnedSuccess:!!clicked, callThrew:callThrew});
+            if (callThrew) stop(stage + "原生调用异常，已停止；请在手机核对。");
             return clicked;
         } finally {
             for (var j = owned.length - 1; j >= 0; j--) owned[j].recycle();
@@ -286,11 +458,18 @@ var FAST_COORDS = null;
         // is never followed by click() or another press, to avoid duplicates.
         var started = Date.now();
         var duration = typeof press === "function" ? stage === "购票入口" ? 1 : 20 : null;
-        var result = duration !== null ? press(x, y, duration) : click(x, y);
-        if (touchTimings.length < 16) touchTimings.push({
+        var result = null, callThrew = false;
+        try { result = duration !== null ? press(x, y, duration) : click(x, y); }
+        catch (ignoredTouch) { callThrew = true; }
+        if (touchTimings.length < 128) touchTimings.push({
             stage: stage, x: x, y: y, startedAfterOriginMs: started - timeOrigin,
-            callMs: Date.now() - started, pressDurationMs: duration
+            callMs: Date.now() - started, pressDurationMs: duration, method: "screen_touch",
+            apiReturnedSuccess: !!result, callThrew: callThrew
         });
+        if (callThrew) {
+            if (stage === "票档确认") skuConfirmRetryStopReason = "dispatch_exception";
+            stop(stage + "触摸调用异常，已停止；请在手机核对。");
+        }
         return result;
     }
     // Shared methods avoid five new Rhino function objects per copied node.
@@ -467,6 +646,8 @@ var FAST_COORDS = null;
         screenRootReadMs += rootReadMs;
         screenTreeCopyMs += Math.max(0, elapsed - rootReadMs);
         screenReadMaxMs = Math.max(screenReadMaxMs, elapsed);
+        captureConfirmationTree();
+        drainToastFeedback();
     }
     function checkPackage(labelsOnly) { readScreen(labelsOnly); }
     function pauseAfterRead(intervalMs) {
@@ -518,6 +699,7 @@ var FAST_COORDS = null;
     function checkBlockers() {
         if (hasAny(CHALLENGE)) stop("猫眼出现验证，请在手机手动处理并核对订单。");
         if (hasAny(PAYMENT) || hasPaymentOrderSheet()) stop("猫眼出现支付页面，请在手机核对并自行付款。");
+        stopOnConfirmationFailure();
         if (hasCongestion()) {
             if (!SUBMIT_TO_PAYMENT || FLOW_PRECHECK_ONLY || SELECTION_REHEARSAL) {
                 stop("当前有拥堵弹窗；只读或选档演练不会刷新，请在手机处理。");
@@ -673,17 +855,38 @@ var FAST_COORDS = null;
             lastEntryTouchEpochMs = clickStarted;
             entryTouchCount++;
         }
+        if (stage === "票档确认") {
+            lastSkuConfirmTouchEpochMs = clickStarted;
+            skuConfirmTouchCount++;
+            confirmFeedbackActive = true;
+        }
         // Reuse the short-touch dispatch for the guarded date, tier, confirm
         // and order actions too. Page readiness is still observed separately.
         var clicked = nativeSkuClickOnce(node, stage);
         if (clicked === null) clicked = shortTouchOnce(x, y, stage);
         if (stage === "购票入口") entryClickCallMs = Date.now() - clickStarted;
-        if (!clicked) stop(stage + "点击结果不明确，已停止；请在手机核对。");
+        if (!clicked) {
+            if (stage === "票档确认") skuConfirmRetryStopReason = "dispatch_failed";
+            stop(stage + "点击结果不明确，已停止；请在手机核对。");
+        }
         screen = null;
     }
     function verifyDetail(requireReservation, reuseDecision, entryOnly) {
         if (!reuseDecision) checkPackage(entryOnly ? "entry" : false);
         checkBlockers();
+        // Returning from AutoX can briefly expose an incomplete Maoyan tree.
+        // Retry reads only; identity and blockers still gate every action.
+        // A healthy first snapshot incurs no extra read or sleep.
+        if (phase === "启动" && (!has(TARGET.titleToken) || !has(TARGET.city))) {
+            var detailReadyDeadline = Date.now() + 1500;
+            while ((!has(TARGET.titleToken) || !has(TARGET.city)) && Date.now() < detailReadyDeadline) {
+                if (hasAny(["选择票档", "实名观演人", "确认购票", "确认购买"])) break;
+                sleep(Math.min(50, detailReadyDeadline - Date.now()));
+                checkPackage(true);
+                checkBlockers();
+            }
+            if (has(TARGET.titleToken) && has(TARGET.city)) mark("详情页信息重读恢复");
+        }
         if (!has(TARGET.titleToken) || !has(TARGET.city)) {
             stop("当前猫眼页面未同时显示目标演出与城市，已停止。");
         }
@@ -697,8 +900,12 @@ var FAST_COORDS = null;
             stop("目标详情页既无预约状态也无唯一购票入口，已停止。");
         }
     }
-    function priceNodes() {
-        var nodes = containedTextNodes(amountTokens), result = [];
+    function priceNodes(amount, tierLabel) {
+        var wantedAmount = amount === undefined ? TARGET.amount : amount;
+        var wantedLabel = tierLabel === undefined ? TARGET.tierLabel : tierLabel;
+        var tokens = amount === undefined ? amountTokens : [String(amount),
+            String(amount).replace(/\B(?=(\d{3})+(?!\d))/g, ",")];
+        var nodes = containedTextNodes(tokens), result = [];
         var headers = exactNodes(["票档"]), upper = 0, lower = device.height;
         if (headers.length === 1 && headers[0].area) upper = headers[0].area.bottom;
         var footer = matching(function (node) {
@@ -713,9 +920,9 @@ var FAST_COORDS = null;
             var bounds = nodes[i].area;
             if (bounds && bounds.top >= upper && bounds.bottom <= lower &&
                     label.length <= 35 && numbers.length === 1 &&
-                    Number(numbers[0]) === TARGET.amount &&
-                    tierKindMatches(label) &&
-                    !/(缺货|售罄|不可售|登记)/.test(label) && candidateAvailable(nodes[i])) result.push(nodes[i]);
+                    Number(numbers[0]) === wantedAmount &&
+                    tierKindMatches(label, wantedLabel) &&
+                    !/(缺货|售罄|售完|无票|无货|不可售|登记|预约|待开售|即将开售)/.test(label) && candidateAvailable(nodes[i])) result.push(nodes[i]);
         }
         // A single Maoyan card can contain both "内场1098元" and "¥1098".
         // Count selectable cards, not repeated amount labels inside one card.
@@ -723,7 +930,7 @@ var FAST_COORDS = null;
         var groups = [];
         for (var r = 0; r < result.length; r++) {
             var card = tierClickableCard(result[r]), group = null;
-            if (card && !tierCardKindMatches(card)) continue;
+            if (card && !tierCardKindMatches(card, wantedLabel)) continue;
             for (var g = 0; card && g < groups.length; g++) {
                 if (groups[g].card === card) { group = groups[g]; break; }
             }
@@ -731,6 +938,48 @@ var FAST_COORDS = null;
             else if (/(?:看台|内场|大屏|站票|坐票|VIP)/.test(result[r].label)) group.node = result[r];
         }
         return groups.map(function (group) { return group.node; });
+    }
+    function availableFallbackTier() {
+        // Only search a real, visible SKU region for this same date. This
+        // switch never treats amounts in a total, notice or order as tiers.
+        if (TARGET.availableTierFallback !== true || !has("选择票档") ||
+                exactNodes(["票档"]).length !== 1 ||
+                !targetDateAlreadySelected() && !onlyTargetDateListed() &&
+                    !(keptCurrentDate && currentDateHasNoConflict())) return null;
+        var candidates = matching(function (node) {
+            var label = node.label.replace(/[,，]/g, "");
+            var numbers = label.match(/\d+(?:\.\d{1,2})?/g) || [];
+            return label.length <= 35 &&
+                (/(?:看台|内场|大屏|站票|坐票|VIP)/.test(label) ||
+                 /^(?:[¥￥]\s*\d+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?\s*元)$/.test(label)) &&
+                !/(优惠|立减|手续费|服务费|原价|折扣)/.test(label) &&
+                !/(缺货|售罄|售完|无票|无货|不可售|登记|预约|待开售|即将开售)/.test(label) &&
+                numbers.length === 1 && Number(numbers[0]) > 0 && Number(numbers[0]) <= 100000 &&
+                node.area && tierClickableCard(node) !== null && candidateAvailable(node);
+        });
+        candidates.sort(function (a, b) {
+            var amountA = Number(a.label.replace(/[,，]/g, "").match(/\d+(?:\.\d{1,2})?/)[0]);
+            var amountB = Number(b.label.replace(/[,，]/g, "").match(/\d+(?:\.\d{1,2})?/)[0]);
+            return amountA - amountB || a.area.top - b.area.top || a.area.left - b.area.left;
+        });
+        for (var i = 0; i < candidates.length; i++) {
+            var label = candidates[i].label;
+            var amount = Number(label.replace(/[,，]/g, "").match(/\d+(?:\.\d{1,2})?/)[0]);
+            var matches = priceNodes(amount, label);
+            if (matches.length === 1 && tierClickableCard(matches[0]) !== null) {
+                return { amount: amount, label: label, node: matches[0] };
+            }
+        }
+        return null;
+    }
+    function selectFallbackTarget(fallback) {
+        fallbackSelection = { fromAmount: TARGET.amount, amount: fallback.amount,
+            tierLabel: fallback.label, date: TARGET.dateLabels[0] };
+        TARGET.amount = fallback.amount;
+        TARGET.tierLabel = fallback.label;
+        rawAmount = String(TARGET.amount);
+        amountTokens = [rawAmount, rawAmount.replace(/\B(?=(\d{3})+(?!\d))/g, ",")];
+        mark("目标档不可售，替补票档=" + TARGET.amount + "元");
     }
     function tierClickableCard(node) {
         var current = node;
@@ -741,19 +990,19 @@ var FAST_COORDS = null;
         }
         return null;
     }
-    function tierCardKindMatches(card) {
+    function tierCardKindMatches(card, expectedLabel) {
         var b = card.area;
         var kinds = matching(function (node) {
             var a = node.area;
             return a && a.left >= b.left && a.right <= b.right && a.top >= b.top && a.bottom <= b.bottom &&
                 node.label.length <= 60 && /(?:看台|内场|大屏|站票|坐票|VIP)/.test(node.label);
         });
-        for (var i = 0; i < kinds.length; i++) if (!tierKindMatches(kinds[i].label)) return false;
+        for (var i = 0; i < kinds.length; i++) if (!tierKindMatches(kinds[i].label, expectedLabel)) return false;
         return true;
     }
-    function tierKindMatches(label) {
+    function tierKindMatches(label, expectedLabel) {
         // Amount alone cannot distinguish two different categories at the same price.
-        var expected = String(TARGET.tierLabel || "").match(/(?:看台|内场|大屏|站票|坐票|VIP)/g) || [];
+        var expected = String((expectedLabel === undefined ? TARGET.tierLabel : expectedLabel) || "").match(/(?:看台|内场|大屏|站票|坐票|VIP)/g) || [];
         var actual = label.match(/(?:看台|内场|大屏|站票|坐票|VIP)/g) || [];
         if (!actual.length) return true; // split text nodes remain subject to uniqueness checks
         for (var i = 0; i < expected.length; i++) if (actual.indexOf(expected[i]) < 0) return false;
@@ -807,6 +1056,7 @@ var FAST_COORDS = null;
         }
         TARGET.amount = record.amount;
         TARGET.tierLabel = record.tierLabel;
+        requestedAmount = record.amount;
         readSelectionFields = true;
         rawAmount = String(TARGET.amount);
         amountTokens = [rawAmount, rawAmount.replace(/\B(?=(\d{3})+(?!\d))/g, ",")];
@@ -816,7 +1066,7 @@ var FAST_COORDS = null;
         if (!node.enabled()) return false;
         // Some builds put the stock badge in a sibling instead of in the
         // price label. Inspect only compact ancestors belonging to this card.
-        var badges = matchingPattern(/(?:缺货登记|售罄|不可售)/, false);
+        var badges = matchingPattern(/(?:缺货|售罄|售完|无票|无货|不可售|登记|预约|待开售|即将开售)/, false);
         var parent = node.parent();
         for (var depth = 0; parent != null && depth < 2; depth++, parent = parent.parent()) {
             if (!parent.enabled()) return false;
@@ -1237,13 +1487,40 @@ var FAST_COORDS = null;
         var target = unique(dateNodes(), "目标日期");
         return nodeAlreadySelected(target);
     }
-    function onlyTargetDateAvailable() {
-        var choices = matching(function (node) {
+    function onlyTargetDateListed() {
+        var choices = dateChoiceNodes();
+        return choices.length === 1 && dateNodes().length === 1 &&
+            choices[0] === dateNodes()[0];
+    }
+    function dateChoiceNodes() {
+        return matching(function (node) {
             return node.area && node.label.length <= 45 &&
                 /^(?:20\d{2}[-./]\d{1,2}[-./]\d{1,2}|(?:20\d{2}年)?\d{1,2}月\d{1,2}日)(?:\s|$)/.test(node.label);
         });
-        return choices.length === 1 && dateNodes().length === 1 &&
-            choices[0] === dateNodes()[0] && priceNodes().length === 1;
+    }
+    function currentDateHasNoConflict() {
+        var wanted = dateNodes();
+        if (wanted.length !== 1) return false;
+        var choices = dateChoiceNodes();
+        for (var i = 0; i < choices.length; i++) {
+            if (choices[i] !== wanted[0] && nodeAlreadySelected(choices[i])) return false;
+        }
+        // With no selected flags, this mode explicitly trusts the user's
+        // current date. This is not proof of selection; orderIdentityMatches
+        // must still verify the configured date before any order submission.
+        return true;
+    }
+    function verifyKeptCurrentDate() {
+        if (keptCurrentDate && !currentDateHasNoConflict()) {
+            stop("沿用当前日期模式发现其他日期已选中或目标日期缺失，已停止；不会点击日期。");
+        }
+    }
+    function onlyTargetDateAvailable() {
+        // A sold-out primary tier does not make the sole event date unknown.
+        // Keep that date when an allowed fallback is already actionable too;
+        // tapping it again can reload the tiers after the next price click.
+        return onlyTargetDateListed() && (priceNodes().length === 1 ||
+            TARGET.availableTierFallback === true && availableFallbackTier() !== null);
     }
     function nodeAlreadySelected(target) {
         var b = target.bounds();
@@ -1272,11 +1549,12 @@ var FAST_COORDS = null;
         if (has("选择票档") && dateNodes().length === 1) return "sku";
         return "unknown";
     }
-    function verifySelectedSku() {
-        if (pageKind() !== "sku" || has("请选择票档")) {
+    function verifySelectedSku(reuseDecision) {
+        if (pageKind(reuseDecision === true) !== "sku" || has("请选择票档")) {
             stop("目标票档尚未使确认按钮可用，已停止。");
         }
         var tier = unique(priceNodes(), "目标票档");
+        verifyKeptCurrentDate();
         if (retainedDateSelection && !targetDateAlreadySelected() ||
                 retainedSingleDate && !onlyTargetDateAvailable()) {
             stop("确认前预选场次状态已变化，已停止。");
@@ -1285,6 +1563,27 @@ var FAST_COORDS = null;
         if (!skuQuantityIsOne()) stop("未确认 1 张数量，已停止。");
         var button = unique(confirmationNodes(), "票档确认按钮");
         safeButtonBounds(button, "票档确认");
+    }
+    function skuConfirmRetryBlockReason(kind) {
+        // Loading pauses touches. A fresh, fully verified SKU may retry when
+        // it returns; a transient overlay must not disable every later retry.
+        if (kind !== "sku") return "page_changed_or_loading";
+        if (hasAny(["加载中", "正在加载", "正在跳转", "排队中", "请稍候", "请稍等",
+                "提交中", "正在提交", "请求中", "库存不足", "前方拥堵", "请刷新重试"]) ||
+                hasAny(ORDER_TITLE) || has("实名观演人")) return "loading_or_overlay";
+        return null;
+    }
+    function skuRetrySelectionReady() {
+        // Transitions can temporarily retain the SKU text while dropping its
+        // selected flags or controls. Observe again rather than aborting an
+        // in-flight transition or touching an unverified button.
+        if (pageKind(true) !== "sku" || has("请选择票档")) return false;
+        var tiers = priceNodes();
+        if (tiers.length !== 1) return false;
+        verifyKeptCurrentDate();
+        if (retainedDateSelection && !targetDateAlreadySelected() ||
+                retainedSingleDate && !onlyTargetDateAvailable()) return false;
+        return skuSelectionMatches(tiers[0]) && skuQuantityIsOne() && confirmationNodes().length === 1;
     }
     function skuSelectionMatches(tier) {
         var amounts = skuTotalAmounts();
@@ -1346,6 +1645,7 @@ var FAST_COORDS = null;
             }
             if (kind === "sku") {
                 unique(priceNodes(), "目标票档");
+                verifyKeptCurrentDate();
                 if (retainedDateSelection && !targetDateAlreadySelected() ||
                         retainedSingleDate && !onlyTargetDateAvailable()) {
                     stop("确认前预选场次状态已变化，已停止。");
@@ -1429,7 +1729,13 @@ var FAST_COORDS = null;
         stop("入口点击后未识别到选票或订单页，已停止；请在手机核对。");
     }
     function continueSkuFlow() {
-        if (!targetDateAlreadySelected() && onlyTargetDateAvailable()) {
+        if (TARGET.dateSelectionMode === "keep_current") {
+            keptCurrentDate = true;
+            verifyKeptCurrentDate();
+            dateDecision = {mode:"keep_current", clicked:false,
+                selectedStateObserved:targetDateAlreadySelected()};
+            mark("沿用当前日期，不点击日期");
+        } else if (!targetDateAlreadySelected() && onlyTargetDateAvailable()) {
             // This Android sheet has already populated tiers for its sole
             // date but supplies no selected flags. Re-tapping that date can
             // reset the existing tier and race the following price touch.
@@ -1458,6 +1764,13 @@ var FAST_COORDS = null;
                 var availableTiers = priceNodes();
                 if (availableTiers.length > 1) stop("目标票档未唯一识别，已停止。");
                 if (availableTiers.length === 1) { tier = availableTiers[0]; break; }
+                var fallback = availableFallbackTier();
+                if (fallback !== null) {
+                    selectFallbackTarget(fallback);
+                    availableTiers = priceNodes();
+                    tier = unique(availableTiers, "替补票档");
+                    break;
+                }
                 // A date tap can replace all tier controls asynchronously.
                 // Observe fresh trees until the requested tier is available.
                 pauseAfterRead(80);
@@ -1469,9 +1782,11 @@ var FAST_COORDS = null;
             // whether Maoyan's reservation restored the tier. Post-click
             // quantity/amount/confirmation checks still use fresh snapshots.
             skuDecision = { tierCandidates: availableTiers.length,
-                selectionMode: "explicit_click", preselectionChecked: false };
+                selectionMode: "explicit_click", preselectionChecked: false,
+                fallbackUsed: fallbackSelection !== null, selectedAmount: TARGET.amount };
             clickFresh("目标票档", priceNodes, function () {
                 if (pageKind() !== "sku") stop("目标票档选择页已变化，已停止。");
+                verifyKeptCurrentDate();
                 if (retainedDateSelection && !targetDateAlreadySelected() ||
                         retainedSingleDate && !onlyTargetDateAvailable()) {
                     stop("选档前预选场次状态已变化，已停止。");
@@ -1521,12 +1836,30 @@ var FAST_COORDS = null;
                 verifySelectedSku);
             mark("点击票档确认");
             var orderTiming = beginTransition("确认后订单页面", "票档确认", ["提交订单"]);
-            var orderDeadline = Date.now() + 8000;
+            var orderDeadline = Date.now() + SKU_CONFIRM_OBSERVE_MS;
             while (Date.now() < orderDeadline) {
-                // The confirmation was already tapped. Never populate or act
-                // on the old SKU; order actions will fetch fresh full fields.
                 var nextKind = readTransitionKind(false, false, "order");
+                if (ENABLE_SAME_PAGE_CONFIRM_RETRY && nextKind !== "order" && skuConfirmRetryStopReason === null) {
+                    var retryBlock = skuConfirmRetryBlockReason(nextKind);
+                    if (retryBlock === null &&
+                            (MAX_SKU_CONFIRM_TOUCHES === null || skuConfirmTouchCount < MAX_SKU_CONFIRM_TOUCHES) &&
+                            Date.now() - lastSkuConfirmTouchEpochMs >= SKU_CONFIRM_RETRY_MS) {
+                        // Transition reads contain labels only. Re-read live
+                        // geometry, enabled state, date, tier and quantity
+                        // before a retry; never reuse a pre-touch snapshot.
+                        checkPackage();
+                        nextKind = pageKind(true);
+                        retryBlock = skuConfirmRetryBlockReason(nextKind);
+                        if (retryBlock === null && skuRetrySelectionReady()) {
+                            clickFresh("票档确认", confirmationNodes,
+                                function () { verifySelectedSku(true); });
+                            mark("同页重试票档确认");
+                        }
+                    }
+                }
                 if (nextKind === "order") {
+                    skuConfirmRetryStopReason = "order_observed";
+                    confirmFeedbackActive = false;
                     observeTransition(orderTiming, "order");
                     completeTransition(orderTiming);
                     mark("到达订单页");
@@ -1534,9 +1867,13 @@ var FAST_COORDS = null;
                     return;
                 }
                 observeTransition(orderTiming, null);
-                pauseAfterRead(80);
+                pauseAfterRead(ENABLE_SAME_PAGE_CONFIRM_RETRY ? 20 : 80);
             }
-            stop("已点击票档确认，但未确认进入订单页；请在手机核对，程序不会重复点击。");
+            if (skuConfirmRetryStopReason === null) skuConfirmRetryStopReason =
+                ENABLE_SAME_PAGE_CONFIRM_RETRY ?
+                    (MAX_SKU_CONFIRM_TOUCHES !== null && skuConfirmTouchCount >= MAX_SKU_CONFIRM_TOUCHES ?
+                        "max_touches" : "deadline") : "no_confirmed_progress";
+            stop("票档确认已尝试 " + skuConfirmTouchCount + " 次，但未确认进入订单页；已停止，请在手机核对。");
             return;
         }
     }
@@ -1704,6 +2041,7 @@ var FAST_COORDS = null;
         // fast mode even while Maoyan was foreground. Normal mode passed the
         // same on-device precheck and keeps the page guard reliable.
         auto.setMode("normal");
+        startToastObserver();
         toast("20 秒内请手动切到猫眼目标演出页");
         sleep(20000);
         if (SELECTION_REHEARSAL) timeOrigin = Date.now();
@@ -1890,6 +2228,8 @@ var FAST_COORDS = null;
         // fixed safe messages, never an exception's original text or stack.
         report(error && error.safe ? error.message :
             "手机端原型遇到未知页面或权限异常，已停止；请在猫眼核对。");
+    } finally {
+        stopToastObserver();
     }
 })();
 
